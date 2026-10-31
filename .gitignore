@@ -12,6 +12,9 @@ compaction-log.json
 .usage.json
 .usage.json.lock
 *.json
+
+!package.json
+
 # --- Temp / scratch ---
 .tmp-deepseek-bot/
 *.tmp
