@@ -7,6 +7,11 @@
   "exports": {
     ".": "./index.mjs"
   },
+  "files": [
+    "index.mjs",
+    "lib",
+    "cordis.patch.yml"
+  ],
   "scripts": {
     "test": "node --test \"test/*.test.mjs\"",
     "selfcheck": "node scripts/selfcheck.mjs"
