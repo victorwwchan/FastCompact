@@ -78,11 +78,7 @@
                 # window-relative thresholdRatio (knob: headroomRatio) — the row carries neither; see README.
                 config:
                   # --- pressure/retention half: owned by @deepseek-ai/dsh-compaction-basic, forwarded untouched ---
-                  # Major setting
-                  thresholdRatio: 0.8            # Context Window Triggering point, when it got 0.8=80%; SHARE OF THE MESSAGE BUDGET (W-O), not of the window, and it governs the MESSAGES only: the plugin re-expresses it per route so the gate lands on floor((W-O)*ratio) and the engine re-checks that gate against the message surface, so the route's tool schemas can never pre-fill it. On strata-llm/64KB (W=65535 O=32000) 0.8 gates at 26,828 tokens = 40.9% of W; at 0.9 it would be 30,181 tokens = 46.1% of W.
-                  contextMaxRatio: 0.25          # Target final Compact Context window Size ratio,0.25=25%, remember after compact there should be extra system prompt will added on it around (1.6(system) + 8.4 (skill+tools))= 10KB will be added(); how much of THAT WINDOW the compiled checkpoint may occupy, as a ratio (not a byte/token length): the reference section is sized from that share, so raising it (or using refLineFormat: none / smaller thoughtChars) lists MORE of the session's older calls line by line — only when even that share cannot hold them do the oldest fold into one range line
-                  # Major setting
-                  
+                  thresholdRatio: 0.8            # SHARE OF THE MESSAGE BUDGET (W-O), not of the window, and it governs the MESSAGES only: the plugin re-expresses it per route so the gate lands on floor((W-O)*ratio) and the engine re-checks that gate against the message surface, so the route's tool schemas can never pre-fill it. On strata-llm/64KB (W=65535 O=32000) 0.8 gates at 26,828 tokens = 40.9% of W; at 0.9 it would be 30,181 tokens = 46.1% of W.
                   retainRatio: 0.12              # tail kept verbatim: floor((W-O) x this); must stay below the gate above
                   maxTokens: 8192                # summary output cap (omit it and the base reuses the derived headroom)
                   compactionRetries: 1           # extra pressure attempts after the first
@@ -93,8 +89,28 @@
                   retainLength: 200              # ONE knob for human text: chars kept of EACH user message pinned in the span (and the last request quote); never fewer than one line per message — over budget the clip shrinks and its recall {"seq": N} pointer stays
                   refLineFormat: thought         # dropped tool traffic becomes session-log ref lines: thought | none (the index covers EVERY earlier span of the session, re-read from the log — not only what an older checkpoint's body happened to keep)
                   instructions: null             # session-log instruction block: null = built-in | string = your text | empty string = off
-                  #debug: true                   # the checkpoint ALSO states the window accounting (usage before / after / freed %, and the gate that tripped it) AND carries the failed-call trail
-                  #debugChars: 400               # per-entry cap for that trail's error text ONLY, in chars (the stats block is not sized by it; debug false = neither block)
+                  contextMaxRatio: 0.25          # how much of THAT WINDOW the compiled checkpoint may occupy, as a ratio (not a byte/token length): the reference section is sized from that share, so raising it (or using refLineFormat: none / smaller thoughtChars) lists MORE of the session's older calls line by line — only when even that share cannot hold them do the oldest fold into one range line
+                  debug: true                    # the checkpoint ALSO states the window accounting (usage before / after / freed %, and the gate that tripped it) AND carries the failed-call trail
+                  debugChars: 400                # per-entry cap for that trail's error text ONLY, in chars (the stats block is not sized by it; debug false = neither block)
+                  # plugin-level keys (optional): harnessEntry, allowUntestedHarness, recallToolName, searchToolName, maxRecallChars, maxSearchHits, headroomRatio
+                  # removed legacy keys: maxRequestBytes, targetRequestBytes, contextRatio, retainTurns, retainBytes, keepRecentImages, dryRun, toolRefs, refKeyArg, refThoughtChars, lastThinkingMode, sessionLogInstruction (our `debug` is re-claimed: it now means the failed-call trail AND the window-accounting block above, not hypercompact's old flag)
+                  # derived per route at mount (never written here): headroomTokens (4% of that route's window, capped) AND thresholdRatio = the SAME gate expressed against W, so the base formula lands on floor((W-O)*row ratio)
+                  
+                  
+                  #modelPolicies:
+                  #  # Per-route overrides: provider and model id must match the live route exactly
+                  #  # (they come from the request header, not from persona or display name).
+                  #  # W = contextWindow declared on that adapter model; O = its request output cap.
+                  #  # Headroom AND the ratio are derived per route from that route's own W and O; a ratio named here is still a share of (W-O).
+                  #  - provider: strata-llm        # default route of the web profile
+                  #    model: 120KB                # budget 90880 -> headroom 4915, gate floor(0.7*90880) = 63,616 tokens = 51.8% of W
+                  #    thresholdRatio: 0.7
+                  #  - provider: strata-llm
+                  #    model: 100KB                # budget 70400 -> headroom 4096, gate floor(0.65*70400) = 45,760 tokens = 44.7% of W
+                  #    thresholdRatio: 0.65
+                  #  - provider: strata-llm        # the tight route: 0.9 here gates at 30,181 tokens, NOT at ~33k (51% of W)
+                  #    model: 64KB                 # budget 33535 -> headroom 2621, gate floor(0.9*33535) = 30,181 tokens = 46.1% of W
+                  #    thresholdRatio: 0.9
       
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'

@@ -18,8 +18,7 @@
 thinking deeply about turn 6 step 3
 [/agent thought seq 109]
 ## Context window stats (this compaction)
-- usage before compact: 29.7% of the window, after compact: 1.6% (gate 46.1%, freed 18,401 tokens)
-- debug dump: C:\Users\vic\.dsh\fast-compact\dsh-fast-compact\debug\session-engine-test-1793491093617-seq2-111.txt
+- usage before compact: n/a of the window (20,959 tokens, capacity unknown for (unknown route)), after compact: n/a (~1,151 tokens, freed 19,808)
 ## Session-log references (dropped tool traffic): seq 5–111
 Restore any original with recall {"seq": N} — several seqs in ONE range request ("a-b"). Need content not visible here? It is still in the FULL session log: call recall_search for it first, then restore the seqs it reports.
 - [thinking deeply about turn 1 step 1] (thought seq 4) → seq 5, result seq 6, 4.0 KB

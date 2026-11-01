@@ -23,6 +23,10 @@ compaction-log.json
 # --- Session transcripts (local runtime state, not for the repo) ---
 sessions/
 
+# --- Generated test output (the e2e suite rewrites these every run — churn, not source) ---
+test/out/
+**/test/out/
+
 # --- Skill hub cache & curator backups (large, regenerable) ---
 skills/.hub/index-cache/
 skills/.curator_backups/
