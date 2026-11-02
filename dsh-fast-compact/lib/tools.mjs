@@ -17,21 +17,19 @@ import { formatKb } from './measure.mjs';
 import { REF_LINE_FORMATS } from './config.mjs';
 import { groupInt, shareOf } from './compiler.mjs';
 
-/** Render token counts the way the user reads them: grouped, with percentages.
+/** Render token counts the way the user reads them: grouped, as a share of the
+ * route's WINDOW — the ONE basis every number in this plugin speaks (the gate is
+ * `ceil(W * thresholdRatio)`, the checkpoint ceiling is `contextMaxRatio` of W).
  * A missing denominator (capacity unknown for this route) simply drops that
  * percentage rather than inventing one.
  * @param {number} value - tokens to phrase.
- * @param {object} stats - carries `messageBudget` and/or `contextWindow` when known.
- * @returns {string} - e.g. ' (97.7% of the budget = 50.0% of the window)' ('' if neither).
+ * @param {object} stats - carries `contextWindow` when known.
+ * @returns {string} - e.g. ' (70.0% of the window)' ('' when the window is unknown).
  */
 function usagePhrase(value, stats) {
   if (stats === undefined || stats === null) return '';
-  const parts = [];
-  const budgetShare = shareOf(value, stats.messageBudget);
-  if (budgetShare !== '') parts.push(`${budgetShare} of the budget`);
   const windowShare = shareOf(value, stats.contextWindow);
-  if (windowShare !== '') parts.push(`${windowShare} of the window`);
-  return parts.length === 0 ? '' : ` (${parts.join(' = ')})`;
+  return windowShare === '' ? '' : ` (${windowShare} of the window)`;
 }
 
 export const DEFAULT_TOOL_NAMES = Object.freeze({ recall: 'recall', search: 'recall_search' });
@@ -272,23 +270,35 @@ export function statusText(status) {
   ];
   // Live window accounting (row knob `debug` is NOT required for this: the command
   // always reports what the gate is and what the surface costs now, so "why did it
-  // fire here" is answerable without waiting for the next compaction).
+  // fire here" is answerable without waiting for the next compaction). Every figure
+  // reads as a share of the WINDOW — the only two context knobs that matter are the
+  // row's `thresholdRatio` (when to fire) and `contextMaxRatio` (what may survive).
   const window = status.window;
   if (window !== undefined && window !== null) {
     if (window.route === null || window.contextWindow === undefined) {
       lines.push(`Context window: capacity not known for this route; current messages ${groupInt(window.currentTokens)} tokens.`);
     } else {
       const gate = window.gateTokens;
+      const clampPhrase = window.clampedToCeiling === true
+        ? ` (the row wanted ${groupInt(window.requestedGateTokens)} tokens of that window; its messages top out at ${gate}, so pressure fires there)`
+        : '';
+      const borrowedPhrase = window.beyondBudget === true ? ' — a share past its message budget: pressure here runs on borrowed time' : '';
       lines.push(
-        `Context window ${window.route}: ${groupInt(window.contextWindow)} tokens, of which ${groupInt(window.outputReserved)} are reserved for the reply → message budget ${groupInt(window.messageBudget)} tokens. `
-        + `Headroom ${groupInt(window.headroomTokens)} → pressure gate ${groupInt(gate)} tokens${usagePhrase(gate, window)}; row thresholdRatio ${window.thresholdRatio} is a share of the BUDGET, so this is where it lands after translation. `
+        `Context window ${window.route}: ${groupInt(window.contextWindow)} tokens. `
+        + `Pressure gate: row thresholdRatio ${window.thresholdRatio} of that window = ${groupInt(window.requestedGateTokens ?? gate)} tokens${usagePhrase(window.requestedGateTokens ?? gate, window)}${clampPhrase}${borrowedPhrase}; it is compared against the MESSAGES alone, so this route's tool schemas never count toward it. `
         + `Current messages: ${groupInt(window.currentTokens)} tokens${usagePhrase(window.currentTokens, window)}`
-        + (typeof window.toolSchemaTokens === 'number' && window.toolSchemaTokens > 0
-          ? `; the envelope also carries ${groupInt(window.toolSchemaTokens)} tokens of tool schemas${usagePhrase(window.toolSchemaTokens, window)} that never count toward the gate (envelope total ${groupInt(window.envelopeTokens)})`
-          : '')
         + `${window.currentTokens >= gate ? ' — at or above the gate: the next request compacts.' : ' — below the gate: no compaction until it reaches ' + groupInt(gate) + ' tokens.'}`,
       );
     }
+  }
+  // The row's own knobs as they resolve for THIS session's route (engine.configStatus,
+  // including any per-route modelPolicies override): when it fires, how much tail
+  // survives verbatim, and the window share this plugin may keep in the compiled
+  // checkpoint (its one knob that never reaches the base).
+  const config = status.config;
+  if (config !== undefined && config !== null) {
+    const retain = typeof config.retainTokens === 'number' ? `retainTokens ${groupInt(config.retainTokens)}` : `retainRatio ${config.retainRatio ?? '—'}`;
+    lines.push(`Config: thresholdRatio ${config.thresholdRatio ?? '—'}, ${retain}, contextMaxRatio ${config.contextMaxRatio ?? '—'}.`);
   }
   // The row knob `debug`: whether dumps are on, where they land (recomputed each
   // call — it follows the dsh process's CWD), and the file the last compaction of
@@ -380,6 +390,7 @@ export function registerCommands(ctx, budgets, warn = () => {}) {
         window: typeof engine.pressureReport === 'function' ? engine.pressureReport(invocation.agent.session) : null,
         // An older build without the method simply keeps the original status shape.
         debug: typeof engine.debugStatus === 'function' ? engine.debugStatus(invocation.agent.session) : null,
+        config: typeof engine.configStatus === 'function' ? engine.configStatus(invocation.agent.session) : null,
       };
       return { kind: 'success', text: statusText(status) };
     },

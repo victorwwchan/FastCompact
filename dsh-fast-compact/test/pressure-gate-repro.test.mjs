@@ -4,31 +4,42 @@
  *   "i set thresholdRatio: 0.8, but it runs the compaction at 28%, and it keeps
  *    compacting after every agent response"
  *
- * What the row MEANS: compaction may only become possible once the conversation
- * MESSAGES have grown to `thresholdRatio` of the route's usable message budget
- * (W - O). What the base actually compares is `tokenMeter.measure(session).totalTokens`
- * against its threshold (compaction-basic/lib/index.js:941), and the real meter
- * prices the whole request envelope, whose tool-schema part is NOT a surface node
- * (`estimateToolsTokens(header)`, dsh-token-meter/lib/index.js:83): with no
- * reusable provider-usage anchor, `totalTokens = toolsTokens + surfaceTokens`
- * (same file, line 753). Tool schemas therefore consume budget before a single
- * message token is counted, and on a small window that shortfall is large enough
- * to make compaction fire long below the configured share - and fire again on
- * every step, because our deterministic checkpoint plus the retained tail keep the
- * post-compaction surface right at the same gate.
+ * What the row MEANS under this plugin: compaction may only become possible once
+ * the conversation MESSAGES have grown to `thresholdRatio` of the route's raw
+ * context window W — one comparison, `surfaceTokens >= ceil(W * ratio)`, with no
+ * output reservation and no headroom in it. What the base actually compares is
+ * `tokenMeter.measure(session).totalTokens` against its own threshold
+ * (compaction-basic/lib/index.js:941), and the real meter prices the WHOLE request
+ * envelope, whose tool-schema part is NOT a surface node (`estimateToolsTokens(header)`,
+ * dsh-token-meter/lib/index.js:83): with no reusable provider-usage anchor,
+ * `totalTokens = toolsTokens + surfaceTokens` (same file, line 753). Tool schemas
+ * therefore consume budget before a single message token is counted, and on a small
+ * window that shortfall is large enough to make compaction fire long below the
+ * configured share — and fire again on every step, because our deterministic
+ * checkpoint plus the retained tail keep the post-compaction surface right at the
+ * same gate.
  *
  * The fixture sizes its tool schemas like the live session's header (measured
  * 2026-10-30 from this workspace's newest durable log: 7,661 tokens of tool
- * schemas), and uses the profile's real route capacity (strata-llm/64KB,
- * contextWindow 65535, maxTokens 32000) with the row's current keys.
+ * schemas), and uses a route reservation that leaves the row's share REACHABLE:
+ * contextWindow 65,535 with an adapter output default of 8,192, so messages can
+ * climb to 54,722 tokens = 83.5% of the window and the row's `thresholdRatio: 0.8`
+ * is a real gate at ceil(65,535 x 0.8) = 52,428 message tokens (80.0% of W). On the
+ * live strata-llm/64KB route that reserves 32,000 for the reply, the same 0.8 share
+ * sits past what messages can hold (33,535 tokens = 51.2% of W), so the gate clamps
+ * to that route's reachable ceiling and pressure fires at the last reachable step —
+ * `engine.mjs` reports the clamp (`clampedToCeiling`, plus `beyondBudget` for the
+ * stronger fact), it never silently moves the share elsewhere. engine.test.mjs pins
+ * that clamped case; this file pins the arming-when-reachable case at 80%.
  *
  * History of the defect, measured 2026-10-30 against this fixture before the fix:
  * pressure armed at turn 6 with only 19,474 message tokens = 29.7% of the window
  * (the reported ~28%), and 6 of the following steps compacted while their messages
  * were still under the gate. `FastCompactEngine.compactIfNeeded` now enforces the
- * gate it derived against the MESSAGE surface (`measurement.surfaceTokens`), so
- * these two tests pin the corrected behavior: arming at turn 9 with 29,206 message
- * tokens (87.1% of the budget), and no step compacting while under the gate.
+ * gate it derived against the MESSAGE surface (`measurement.surfaceTokens`) read off
+ * the meter's own surface-only projection, so these two tests pin the corrected
+ * behavior: arming only once the messages reach ceil(W × ratio), and no step
+ * compacting while they sit under it.
  *
  * Skipped when dsh is not installed (needs the real base engine and meter math).
  */
@@ -45,11 +56,14 @@ import { buildEvents } from './helpers.mjs';
 const entry = findDsh();
 const skip = entry === undefined ? 'dsh is not installed' : false;
 
-// The live route and the live row, verbatim from profiles/web/cordis.patch.yml
-// (agent-default-model: strata-llm/64KB) and dsh-fast-compact-preset/cordis.patch.yml.
+// The preset's tight-route share (its commented modelPolicies carry thresholdRatio: 0.8 for
+// strata-llm/64KB; the top-level default is 0.7) put on a route whose reply reservation leaves
+// that share REACHABLE, so this file can pin arming exactly AT 80% of the window. On the live
+// 64KB route (O=32,000) that same share clamps to 30,914 = 47.2%, and engine.test.mjs pins that
+// clamp instead.
 const WINDOW = 65_535;
-const OUTPUT_RESERVED = 32_000;
-const ROW = { thresholdRatio: 0.8, retainRatio: 0.12, maxTokens: 8192, compactionRetries: 1, auto: true };
+const OUTPUT_RESERVED = 8_192;
+const ROW = { thresholdRatio: 0.8, retainRatio: 0.12, compactionRetries: 1, auto: true };
 
 async function harness() {
   if (harness.loaded === undefined) {
@@ -149,14 +163,13 @@ async function setup(turns, tools) {
   return { session, engine, agent, logs, meter, route: pressureTable, events };
 }
 
-/** The gate the row means, in message tokens. */
+/** The gate the row means, in message tokens: its share of the raw window. */
 function intendedMessageGate(rowRatio) {
-  const budget = WINDOW - OUTPUT_RESERVED;
-  return Math.floor(budget * rowRatio);
+  return Math.ceil(WINDOW * rowRatio);
 }
 
 /** Grow the conversation until the base's pressure pass decides to compact. */
-async function armed(turnMax = 12) {
+async function armed(turnMax = 26) {
   const tools = liveTools(24);
   for (let turns = 1; turns <= turnMax; turns += 1) {
     const setupResult = await setup(turns, tools);
@@ -174,29 +187,30 @@ test('pressure basis: the row arms compaction only once its messages reach their
   assert.ok(overhead >= 7_000 && overhead <= 8_000, `fixture tool schemas price ${overhead} tokens, near the live header's 7,661`);
 
   const armedAt = await armed();
-  assert.ok(armedAt !== null, 'pressure compacted within 12 turns at all');
+  assert.ok(armedAt !== null, 'pressure compacted within 26 turns at all');
 
   const budget = WINDOW - OUTPUT_RESERVED;
   const surfaceTokens = armedAt.measurement.surfaceTokens;
   const messageGate = intendedMessageGate(ROW.thresholdRatio);
-  console.log(`armed at turn ${armedAt.turn}: tool schemas ${armedAt.measurement.totalTokens - surfaceTokens} tokens; messages ${surfaceTokens} tokens = ${((100 * surfaceTokens / budget).toFixed(1))}% of the ${budget}-token budget = ${((100 * surfaceTokens / WINDOW).toFixed(1))}% of the window; the row wants ${messageGate} message tokens (${(100 * ROW.thresholdRatio).toFixed(0)}%)`);
+  console.log(`armed at turn ${armedAt.turn}: tool schemas ${armedAt.measurement.totalTokens - surfaceTokens} tokens; messages ${surfaceTokens} tokens = ${((100 * surfaceTokens / WINDOW).toFixed(1))}% of the ${WINDOW}-token window (the route's message budget is only ${budget}, so pressure can never climb past ${((100 * budget / WINDOW).toFixed(1))}%); the row wants ${messageGate} message tokens (${(100 * ROW.thresholdRatio).toFixed(0)}% of the window)`);
   assert.ok(
     surfaceTokens >= messageGate,
-    `the messages alone (${surfaceTokens}) had NOT reached the row's ${ROW.thresholdRatio} of the usable budget (${messageGate}) when compaction armed`,
+    `the messages alone (${surfaceTokens}) had NOT reached the row's ${ROW.thresholdRatio} of the WINDOW (${messageGate}) when compaction armed`,
   );
 });
 
 test('pressure basis: no step of the same traffic compacts while its messages sit under the gate', { skip }, async () => {
   const armedAt = await armed();
-  assert.ok(armedAt !== null, 'pressure compacted within 12 turns at all');
+  assert.ok(armedAt !== null, 'pressure compacted within 26 turns at all');
 
   // The row's share is a per-step claim, not a one-off: on EVERY step of ordinary
   // traffic the base may only arm once this session's messages have reached it.
   // The live "it compacts after every response" symptom shows up here as the steps
   // that armed while their surface was still under the gate — the base's envelope
-  // basis (tool schemas included) made it arm ~7,700 tokens too early.
+  // basis (tool schemas included) made it arm ~7,700 tokens too early, and the old
+  // budget-relative reading put the gate at floor(33,535 x 0.4) = 13,414 message
+  // tokens, half of one step's claim below the window share this plugin enforces.
   const tools = liveTools(24);
-  const budget = WINDOW - OUTPUT_RESERVED;
   const messageGate = intendedMessageGate(ROW.thresholdRatio);
   const misfires = [];
   for (let turns = 1; turns <= armedAt.turn + 3; turns += 1) {

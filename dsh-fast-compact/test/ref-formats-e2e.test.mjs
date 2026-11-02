@@ -22,7 +22,7 @@
  *     test\fixtures\session-fa7af7bf-afee-45bf-b552-e2b5b21276eb.v4.jsonl.zstd
  *
  * Run it (from dsh-fast-compact\, PowerShell; `node --test` cannot spawn here):
- *   $env:DSH_ENTRY='C:\Users\vic\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh\lib\bin.js'
+ *   $env:DSH_ENTRY='<your @deepseek-ai/dsh install dir>\lib\bin.js'
  *   node test/ref-formats-e2e.test.mjs           2>$null; "exit=$LASTEXITCODE"
  *
  * Skipped when dsh is not installed or the sample log cannot be compacted. The

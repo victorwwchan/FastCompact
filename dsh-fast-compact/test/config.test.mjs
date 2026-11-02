@@ -8,9 +8,9 @@
  * table `index.mjs` fills in — and anything else fails at mount, so a stale row
  * from the old vendored surface (`toolRefs`, `refThoughtChars`,
  * `lastThinkingChars`, …) cannot silently fall back to a default. TWO base keys
- * are not forwarded as written: `headroomTokens` is derived per route AND
- * `thresholdRatio` is re-expressed per route against that route's usable message
- * budget (see the derivation tests below).
+ * are not forwarded as written: `headroomTokens` is derived per route, `thresholdRatio`
+ * rides untouched as a share of that route's WINDOW, and `maxTokens` (the summary's
+ * output cap) is filled in per route from that same share when the row left it out.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -130,41 +130,81 @@ test('config: a named ratio governs its own share of the MESSAGE BUDGET, not of 
   assert.equal(deriveHeadroomTokens(84_000, 0.6, 0, HEADROOM_RATIO), Math.round(84_000 * HEADROOM_RATIO), 'share governs; gate = 0.6W');
 });
 
-test('config: the translated ratio makes the base formula land on the row share', () => {
-  // Re-run the base's OWN gate formula (floor(min(W*ratio, W-O-headroom))) against
-  // what deriveRoutePressure hands back: it must equal floor((W-O)*rowRatio) — the
-  // share of the message budget the row actually named.
-  const gate = (window, ratio, headroom, output) => Math.floor(Math.min(window * ratio, window - output - headroom));
+test('config: the gate is the row share of the WINDOW, whatever the reply reservation is', () => {
+  // The plugin's OWN comparison (meter surface vs ceil(W * ratio)) must not move
+  // with the output reservation, and must stay at or above wherever the base's
+  // formula lands — otherwise a route would compact earlier than the row asked.
+  const baseGate = (window, ratio, headroom, output) => Math.floor(Math.min(window * ratio, window - output - headroom));
   for (const [window, output, rowRatio] of [[65_535, 32_000, 0.9], [65_535, 32_000, 0.6], [122_880, 32_000, 0.9], [102_400, 32_000, 0.7], [84_000, 0, 0.6], [8_000, 6_000, 0.5]]) {
     const pressure = deriveRoutePressure(window, rowRatio, output, HEADROOM_RATIO);
     const budget = window - output;
-    const expected = Math.floor(budget * rowRatio);
-    assert.equal(pressure.thresholdRatio !== null ? gate(window, pressure.thresholdRatio, pressure.headroomTokens, output) : gate(window, rowRatio, pressure.headroomTokens, output), expected, `gate = ${rowRatio} of the budget on W=${window}`);
-    assert.ok(pressure.headroomTokens <= budget - expected, `headroom ${pressure.headroomTokens} leaves ${budget - pressure.headroomTokens} >= the gate ${expected} of the ${budget}-token budget`);
+    const requested = Math.ceil(window * rowRatio);
+    const ceiling = budget - pressure.headroomTokens;
+    assert.equal(pressure.gateTokens, Math.min(requested, Math.max(1, ceiling)), `gate = the row's ${rowRatio} of W=${window}, clamped to the ${ceiling}-token ceiling its messages can reach`);
+    assert.equal(pressure.requestedGateTokens, requested, 'the raw share is reported untouched beside the effective gate');
+    assert.equal(pressure.thresholdRatio, rowRatio, 'the ratio rides untouched: same window basis every report prints');
+    const base = baseGate(window, pressure.thresholdRatio, pressure.headroomTokens, output);
+    assert.ok(base <= pressure.gateTokens, `the base's own min() lands at ${base}, never past the gate ${pressure.gateTokens} that governs here`);
+    assert.equal(pressure.clampedToCeiling, requested > ceiling, `the clamp flag says whether W=${window} could reach the share`);
+    assert.equal(pressure.beyondBudget, requested > budget, `a share past the ${budget}-token message budget is reported as borrowed time on W=${window}`);
   }
-  // The 64KB route the user hit: forwarding 0.9 unchanged caps the gate at the
-  // structural ceiling; translated, it fires at floor(33535*0.9) = 30181 tokens.
+  // The 64KB route the user hit: 0.9 names 90% of the WINDOW, and its messages
+  // cannot get there — so the gate lands at the last reachable step and says so.
   const tight = deriveRoutePressure(65_535, 0.9, 32_000, HEADROOM_RATIO);
-  assert.equal(Math.floor(65_535 * tight.thresholdRatio), 30_181, 'row 0.9 now means 90% of the 33535-token message budget');
-  assert.ok(30_181 / 65_535 < 0.5, 'gate 30,181 of a 65,535-token window is 46.1% — under half the raw window, which is why 0.9 used to look like it fired at ~0.5');
+  assert.equal(tight.requestedGateTokens, Math.ceil(65_535 * 0.9), 'row 0.9 wants 90% of the 65,535-token window: 58,982 tokens of messages');
+  assert.equal(tight.gateTokens, 30_914, 'its messages top out at 33,535 - 2,621 headroom, so the gate lands there (pressure fires at the last reachable step)');
+  assert.ok(tight.clampedToCeiling, 'the clamp is reported, not hidden somewhere else');
+  assert.equal(tight.thresholdRatio, 0.9, 'the row number is the gate basis verbatim — no translation against the budget');
+  assert.ok(tight.beyondBudget, 'that share sits past the 33,535-token message budget: pressure here runs on borrowed time');
 });
 
-test('config: the translated ratio rides into the modelPolicies entry of each route', () => {
+test('config: the summary cap auto-aligns to the same share (no hand-written maxTokens)', () => {
+  for (const [window, output, rowRatio] of [[122_880, 32_000, 0.7], [65_535, 32_000, 0.9], [102_400, 32_000, 0.65], [8_000, 6_000, 0.5], [84_000, 0, 0.6]]) {
+    const pressure = deriveRoutePressure(window, rowRatio, output, HEADROOM_RATIO);
+    const free = Math.max(HEADROOM_MIN_TOKENS, window - pressure.gateTokens);
+    assert.equal(pressure.outputCapTokens, output > 0 ? Math.min(output, free) : free, `cap = min(adapter default ${output}, W - gate = ${free}) on W=${window}`);
+    assert.ok(pressure.outputCapTokens + pressure.gateTokens <= window, `gate ${pressure.gateTokens} + summary ${pressure.outputCapTokens} never over-requests the ${window}-token window`);
+  }
+  const none = deriveRoutePressure(122_880, null, 32_000, HEADROOM_RATIO);
+  assert.equal(none.outputCapTokens, null, 'no share named: nothing to align to, so the base keeps its own reservation');
+});
+
+test('config: the aligned cap lands on each policy; a hand-written maxTokens wins', () => {
+  const host = { retainRatio: 0.12, modelPolicies: [{ provider: 'strata-llm', model: '64KB' }] };
+  const derived = {
+    topLevel: 2_621,
+    topLevelThresholdRatio: 0.7,
+    topLevelOutputCap: 32_768,
+    perRoute: [
+      { provider: 'strata-llm', model: '120KB', contextWindow: 122_880, defaultMaxTokens: 32_000, headroomTokens: 4_915, thresholdRatio: 0.7, outputCapTokens: 32_000 },
+    ],
+  };
+  const merged = applyDerivedHeadroom(host, derived);
+  assert.equal(merged.maxTokens, 32_768, 'row left maxTokens out: the tightest-window share fills it');
+  assert.equal(merged.modelPolicies[0].maxTokens, 32_768, 'an unlisted route takes that top-level cap');
+  assert.equal(merged.modelPolicies[1].maxTokens, 32_000, 'a named route takes its own aligned cap (adapter default was the tighter term)');
+  assert.equal('contextWindow' in merged.modelPolicies[1], false, 'capacity facts still stay out of the base’s policy schema');
+  const handSet = applyDerivedHeadroom({ ...host, maxTokens: 8192 }, derived);
+  assert.equal(handSet.maxTokens, 8192, 'a row that still writes maxTokens keeps its own value');
+  assert.equal(handSet.modelPolicies[0].maxTokens, undefined, 'and no derived cap is injected beside it: that policy inherits the row’s own value');
+});
+
+test('config: the row ratio rides into the modelPolicies entry of each route', () => {
   const host = { thresholdRatio: 0.6, retainRatio: 0.12, modelPolicies: [{ provider: 'strata-llm', model: '120KB', retainRatio: 0.3 }] };
   const derived = {
     topLevel: 4_915,
-    topLevelThresholdRatio: 0.6 * (1 - 32_000 / 122_880),
+    topLevelThresholdRatio: 0.6,
     perRoute: [
-      { provider: 'strata-llm', model: '120KB', contextWindow: 122_880, defaultMaxTokens: 32_000, headroomTokens: 4_915, thresholdRatio: (65_535 * 0 + 90_880 * 0.6) / 122_880 },
-      { provider: 'strata-llm', model: '64KB', contextWindow: 65_535, defaultMaxTokens: 32_000, headroomTokens: 2_621, thresholdRatio: (33_535 * 0.9) / 65_535 },
+      { provider: 'strata-llm', model: '120KB', contextWindow: 122_880, defaultMaxTokens: 32_000, headroomTokens: 4_915, thresholdRatio: 0.6 },
+      { provider: 'strata-llm', model: '64KB', contextWindow: 65_535, defaultMaxTokens: 32_000, headroomTokens: 2_621, thresholdRatio: 0.9 },
     ],
   };
   const merged = applyDerivedHeadroom(host, derived);
   assert.equal(merged.headroomTokens, 4_915, 'row-level headroom');
-  assert.equal(merged.thresholdRatio, 0.6 * (1 - 32_000 / 122_880), 'unlisted routes get the translated default ratio');
-  assert.deepEqual(merged.modelPolicies[0], { provider: 'strata-llm', model: '120KB', retainRatio: 0.3, headroomTokens: 4_915, thresholdRatio: (90_880 * 0.6) / 122_880 }, 'existing policy kept its other keys and took the translated ratio');
+  assert.equal(merged.thresholdRatio, 0.6, 'unlisted routes keep the row share of the window');
+  assert.deepEqual(merged.modelPolicies[0], { provider: 'strata-llm', model: '120KB', retainRatio: 0.3, headroomTokens: 4_915, thresholdRatio: 0.6 }, 'existing policy kept its other keys and took the row share verbatim');
   assert.equal(merged.modelPolicies[1].provider, 'strata-llm', 'unlisted route appended with its own pair');
-  assert.equal(merged.modelPolicies[1].thresholdRatio, (33_535 * 0.9) / 65_535, 'and its own translated ratio');
+  assert.equal(merged.modelPolicies[1].thresholdRatio, 0.9, 'and its own window share, untranslated');
   assert.equal('contextWindow' in merged.modelPolicies[1], false, 'capacity facts stay out of the base’s policy schema');
 });
 

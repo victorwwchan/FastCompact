@@ -99,7 +99,7 @@ Three disjoint sets; anything else in the row fails at mount.
 | `recallToolName` / `searchToolName` | `recall` / `recall_search` | rename the registered recall tools (`/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/`) |
 | `maxRecallChars` | `60000` | chars per `recall` page (integer ≥ 1; longer output paginates via `offset`) |
 | `maxSearchHits` | `40` | events one `recall_search` reports (integer ≥ 1) |
-| `headroomRatio` | `0.04` | share of each route's `contextWindow` used as the starting headroom B; replaces hand-set `headroomTokens` (the ratio is then re-expressed per route — see below) |
+| `headroomRatio` | `0.04` | share of each route's `contextWindow` used as the starting headroom B; replaces hand-set `headroomTokens` (B only feeds the base's own envelope formula — the plugin's gate never consults it, see below) |
 
 **Content keys** owned by the engine (`lib/config.mjs`):
 
@@ -117,11 +117,14 @@ Three disjoint sets; anything else in the row fails at mount.
 **Host keys** forwarded to the base engine (validated there):
 `thresholdRatio`, `retainRatio`, `retainTokens`, `maxTokens`, `compactionRetries`,
 `maxOverflowRetries`, `modelPolicies`, `auto` — plus TWO host keys that are **derived,
-never forwarded**: `headroomTokens` AND `thresholdRatio`. A row that sets `headroomTokens`
-(top level or inside a `modelPolicies` entry) fails at mount with a message saying so; the
-plugin derives it per route instead. The row's `thresholdRatio` is not a share of the
-window — see the section below; the plugin keeps the number you wrote but re-expresses it,
-per route, against that route's usable message budget.
+never required**: `headroomTokens` (rejected if the row sets it), while `thresholdRatio` rides the host half **verbatim**,
+and `maxTokens` (the summary's output cap) is **filled in per route** from the same share when the row leaves it out —
+a row that still writes `maxTokens` keeps its own value at every level. A row that sets `headroomTokens` (top level or inside a `modelPolicies` entry) fails at mount
+with a message saying so; the plugin derives it per route instead. The row's `thresholdRatio`
+IS a share of the window — one number, read the same way everywhere: this plugin gates on
+`ceil(W * thresholdRatio)` against the meter's surface reading, and forwards the ratio untouched
+so the base sees the same share (see the section below for how the two readings differ). The
+summary cap follows that same share: `min(that route's adapter default, W - gate)`.
 
 ### How the pressure gate gets sized
 
@@ -133,36 +136,50 @@ fires when   measuredTokens >= floor(min(W * thresholdRatio, W - O - B))
 retention    floor((W - O) * retainRatio)        // must stay below the gate
 ```
 
-You no longer pick B, and you do not have to translate the ratio either. At mount, `index.mjs` asks the same `llm` service the base prices against — `listProviders` → `listModels` → `resolveModelInfo` — and calls `deriveRoutePressure(contextWindow, ratio, defaultMaxTokens, headroomRatio)` for **every route the profile offers**. It returns BOTH host keys for that route (`{ headroomTokens, thresholdRatio }`), which `applyDerivedHeadroom` merges into the host half: each readable route gets its own `modelPolicies` entry carrying only `provider`, `model`, `headroomTokens` and the translated `thresholdRatio` — capacity facts stay out of the base's policy schema — and the row-level default is sized from the **tightest** window read, so an unlisted route can never carry a headroom bigger than its own budget. The capacities come from the adapter metadata the base reads at request time, so gate and pricing cannot drift apart.
+You no longer pick B, and you no longer write the summary's output cap. At mount, `index.mjs` asks the same `llm` service the base prices
+against — `listProviders` → `listModels` → `resolveModelInfo` — and calls
+`deriveRoutePressure(contextWindow, ratio, defaultMaxTokens, headroomRatio)` for **every route
+the profile offers**. It returns `{ headroomTokens, thresholdRatio, gateTokens, requestedGateTokens, ceilingTokens, clampedToCeiling, beyondBudget, outputCapTokens }` for that route: B sized as a
+share of THAT route's window (capped at a quarter of its message budget so the margin can never
+steal the `1 - r` you left free), `thresholdRatio` forwarded **verbatim** — there is nothing
+to translate any more, because the row's share means the same thing on both sides — and the summary
+cap as `min(that route's adapter default, W - gate)`, so the compaction request can never ask for
+more than what its own gate left free. Each readable
+route gets its own `modelPolicies` entry carrying only `provider`, `model`, `headroomTokens`,
+that ratio and that cap; capacity facts stay out of the base's policy schema, and the row-level default is
+sized from the **tightest** window read, so an unlisted route can never carry a headroom bigger
+than its own budget. The capacities come from the adapter metadata the base reads at request time,
+so gate and pricing cannot drift apart.
 
 The math, per route (`budget = W - O` is what messages may use; `r` = the row's ratio):
 
 ```text
 share   = max(1024, round(W * headroomRatio))     budgetCap = floor(budget / 4)
-B       = min(share, budgetCap)                   target = floor(budget * r)
-margin  = budget - target                         B = min(B, margin)          (>= 1)
-gate    = min(target, budget - B)                 effRatio = gate / W
+B       = min(share, budgetCap)     ceiling = budget - B     gate = min(ceil(W * r), max(1, ceiling))  // guard
+base    = floor(min(W * r, W - O - B))            // the base's own envelope threshold
 ```
 
-So the base's own formula — `floor(min(W * effRatio, W - O - B))` — lands exactly on
-`floor((W - O) * r)`: the percentage you wrote is a share of the MESSAGE BUDGET, and
-the headroom never steals the `1 - r` you left free. Live web-profile numbers
-(`headroomRatio` 0.04):
+So the plugin's guard is exactly the percentage you wrote — as a share of the WINDOW — read
+against `tokenMeter.measure(session).surfaceTokens`, the meter's surface-only projection — with one
+exception: a share the messages can physically never reach clamps to `ceiling`, so pressure fires
+at the last reachable step before the request overflows; the clamp is reported (`clampedToCeiling`,
+plus `beyondBudget` when that share sits past the message budget) and printed where it was seen.
+Live web-profile numbers (`headroomRatio` 0.04, row ratios from the preset):
 
-| route | W | O | budget | derived B | gate | % of budget / % of window |
-| --- | --- | --- | --- | --- | --- | --- |
-| `strata-llm/120KB` (ratio 0.7) | 122880 | 32000 | 90880 | 4915 | 63,616 | 70.0% / 51.8% |
-| `strata-llm/100KB` (ratio 0.65) | 102400 | 32000 | 70400 | 4096 | 45,760 | 65.0% / 44.7% |
-| `strata-llm/64KB` (ratio 0.9) | 65535 | 32000 | 33535 | 2621 | 30,181 | 90.0% / 46.1% |
-| `llama-cpp/84k` (ratio 0.6, no declared O) | 84000 | 0 | 84000 | 3360 | 50,400 | 60.0% / 60.0% |
+| route | W | O | budget | derived B | plugin gate | base threshold | gate as % of W |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `strata-llm/120KB` (ratio 0.7) | 122880 | 32000 | 90880 | 4915 | 85,965 | 85,965 | 69.9% (clamped from 86,016) |
+| `strata-llm/100KB` (ratio 0.65) | 102400 | 32000 | 70400 | 4096 | 66,304 | 66,304 | 64.8% (clamped from 66,560) |
+| `strata-llm/64KB` (ratio 0.8) | 65535 | 32000 | 33535 | 2621 | 30,914 | 30,914 | 47.2% (clamped from 52,428 = 80%) |
+| `llama-cpp/84k` (ratio 0.6, no declared O) | 84000 | 0 | 84000 | 3360 | 50,400 | 50,400 | 60.0% |
 
-Why the ratio had to be re-expressed: a window-relative `thresholdRatio` can never
-gate above `W - O - B`, so on `strata-llm/64KB` no setting could ever fire past
-**51% of W** (its budget is 33,535 tokens with no headroom at all). Writing `0.9`
-there used to land on that ceiling — the trigger tripped around "half the window"
-in the UI while the row said 90%, and the gap was pure arithmetic. Budget-relative
-shares have no such ceiling below 100%: `r = 0.9` means 90% of what the messages
-may actually occupy.
+What a share past the message budget means now: on `strata-llm/64KB` the reply reservation alone
+takes 32,000 tokens, so messages can never hold 80% of that window (they top out at 51.2%).
+That share no longer stops being a gate — it clamps to the last reachable step (the ceiling
+`budget - B` = 30,914 tokens = 47.2% of W), so pressure still fires before the request overflows;
+`clampedToCeiling` plus `beyondBudget` say which share had to move aside, and both the mount line
+and the stats block print it. A share the messages CAN reach (up to ~51.1% on that route) fires
+exactly where you wrote it.
 
 One more gap sits under that arithmetic, and it is not arithmetic at all: the meter
 prices the WHOLE request envelope — `totalTokens = toolSchemaTokens + surfaceTokens`
@@ -177,18 +194,23 @@ against `measurement.surfaceTokens` — the message surface alone — and defers
 pressure compaction until THAT share is reached; `context-overflow` recovery is never
 deferred, and a route whose capacity this plugin never named keeps the base's own decision.
 
-The gate is not mount-only: `learnRoute` reads an unnamed route's capacity through the
-same `ctx.llm` service at the FIRST pressure decision and caches the derived pair. A web
-profile resolves its providers only after the plugins mounted, so a mount-time-only table
-leaves `perRoute` empty and every session runs on the base's untranslated default — the
-"it compacts after every response again" symptom. Learned gates govern the guard from then
-on, and the stats block prints real percentages instead of giving up.
+The gate is not mount-only: `learnRoute` reads an unnamed route's capacity straight from
+the session — `requestContext()`, the same window the meter's own `contextPressure`
+projection divides by — and falls back to `ctx.llm.resolveModelInfo` only when that session
+has not ridden a request yet. A web profile resolves its providers after the plugins mounted,
+so a mount-time-only table leaves `perRoute` empty and every session runs on the base's
+envelope threshold instead — the "it compacts after every response again" symptom. Learned
+gates govern the guard from then on, and the stats block prints real percentages instead of
+giving up.
 
 What the debug block prints is deliberately tiny: the checkpoint's `## Context window stats`
-is ONE line — usage before and after as shares of the window, the gate, the tokens freed and
-the tool-schema clause — because those tokens stay in the window forever. The full envelope
-breakdown (window, budget, headroom, each figure in tokens) belongs to `/fastcompact`, which
-the user runs when they want the detail.
+is ONE line — usage before and after as shares of the window, the gate (also as a share of
+the window), and the tokens freed — because those tokens stay in the window forever. Nothing
+else is printed there: the row's only context decisions are `thresholdRatio` (when to fire)
+and `contextMaxRatio` (what may survive), both shares of W, so every number in that line
+reads on the same basis you wrote. `/fastcompact` spells the same shares out for the live
+session (window, gate, current messages) when you want the sentences rather than the log
+line; a gate past what its messages can hold says so on both.
 
 What the old hand-tuned B got wrong, and what this removes: the base default
 `B = 65536` put the trigger at 25344 tokens = **0.21 of the window** on `strata-llm/120KB`,
@@ -209,8 +231,10 @@ route's own window. Still honest failures, unchanged:
 
 Tune per route with `modelPolicies` — `provider` and `model` must match the live
 request header exactly (not the persona or display name). Name `thresholdRatio` and
-retention there; set `maxTokens` explicitly (the summary output cap — left out, the
-base reuses the derived headroom, which is usually too small for a summary).
+retention there; leave `maxTokens` out — the summary's output cap is derived per route
+as `min(that route's adapter default, W - gate)`, so it follows the share you named and
+can never over-request what that gate left free. A value you do write (top level or in
+one policy) wins over that aligned cap, at every level.
 
 Byte caps in code (`lib/config.mjs`): `PINNED_MESSAGE_BYTES` 8000 per pinned
 entry, `PINNED_BLOCK_BYTES` 24000 for the whole pinned block,
@@ -223,10 +247,9 @@ above); over any budget → oldest lines fold.
 
 The installable unit is the **preset bundle** `dsh-fast-compact-preset`: a copy
 of the shipped "standard" preset whose `compaction` isolate group carries this
-row (live file: `C:\Users\vic\.dsh\fast-compact\dsh-fast-compact-preset\cordis.patch.yml`,
-already on the new keys — host-pressure keys plus `thoughtChars`, `refLineFormat`,
-`instructions`). Install the bundle, select preset `preset-fast-compact`, start a
-new session. This package's own `cordis.patch.yml` is a comment header plus an
+row (its `cordis.patch.yml` is already on the new keys — host-pressure keys plus
+`thoughtChars`, `refLineFormat`, `instructions`). Install the bundle, select
+preset `preset-fast-compact`, start a new session. This package's own `cordis.patch.yml` is a comment header plus an
 empty row list (`[]`) — installing it alone can never change the host boot.
 
 The row REPLACES any other compaction engine in that isolate group (one
@@ -276,10 +299,32 @@ is now ONE switch of ours — the failed-call trail AND the window-accounting bl
 with `debugChars` sizing only the trail's error text; hypercompact's old meaning of it
 no longer exists.)
 
+## Package contents
+
+| File | What it is |
+| --- | --- |
+| [index.mjs](<index.mjs>) | Plugin entry: mount/apply + plugin-level row keys. |
+| [lib/engine.mjs](<lib/engine.mjs>) | `FastCompactEngine` — the single `summarize` override. |
+| [lib/runtime.mjs](<lib/runtime.mjs>) | Version gate against the running DSH install. |
+| [lib/config.mjs](<lib/config.mjs>) | Row-config split/validation (`splitRowConfig`, `resolveFastCompactConfig`). |
+| [lib/compiler.mjs](<lib/compiler.mjs>) | `buildCheckpoint` — the deterministic block compiler. |
+| [lib/references.mjs](<lib/references.mjs>) | Cumulative session-log reference lines + parsing them back. |
+| [lib/measure.mjs](<lib/measure.mjs>) | Token measurement for gate/sizing decisions. |
+| [lib/messages.mjs](<lib/messages.mjs>) | Message/span walking over the session log. |
+| [lib/pins.mjs](<lib/pins.mjs>) | Pinned-content selection (every user message kept). |
+| [lib/recall.mjs](<lib/recall.mjs>) | Recall-surface helpers used by the compiled instruction block. |
+| [lib/tools.mjs](<lib/tools.mjs>) | Tool-call/result plumbing for reference lines. |
+| [scripts/selfcheck.mjs](<scripts/selfcheck.mjs>) | 19 static + mount checks (`npm run selfcheck`). |
+| [scripts/find-dsh.mjs](<scripts/find-dsh.mjs>) | DSH entry resolution (DSH_ENTRY → `where dsh` → npm global). |
+| [test/](<test/>) | 8 test files (100 tests) + fixtures; reports land in `test/out/`. |
+| [docs/reports/](<docs/reports/>) | The two field-test stress reports and their comparison (see above). |
+| [cordis.patch.yml](<cordis.patch.yml>) | Empty mount patch (comment header + `[]`). |
+| [LICENSE](<LICENSE>) | MIT, owned by vicschan. |
+
 ## Tests
 
 ```sh
-npm test        # node --test "test/*.test.mjs" — 68 tests (60 pure + 8 that need the harness): config, measure, references, compiler, engine, ref-formats-e2e
+npm test        # node --test "test/*.test.mjs" — 100 tests (88 pure: config, measure, references, compiler, tools, pressure-gate-repro; 12 harness: engine, ref-formats-e2e)
 npm run selfcheck   # scripts/selfcheck.mjs — 19 static + mount checks
 ```
 
@@ -290,6 +335,22 @@ formats × `thoughtChars` {0, 200} and writes `test/out/ref-formats-e2e-report.m
 sandboxed PATH cannot find it; `scripts/find-dsh.mjs` resolves DSH_ENTRY → `where dsh`
 → npm global root. On Windows, `node --test` may hit the sandbox's named-pipe
 limit — run the test files directly with `node` if so.
+
+## Field-test reports
+
+Two live-session stress runs of this preset (64K window, gate ≈ 30,914 tokens,
+`retainRatio` 0.12) plus a fear-vs-truth comparison of them, in `docs/reports/`:
+
+- [compactBasic.md](<docs/reports/compactBasic.md>) — reference run: 300-entry detail
+  corpus, ~10 auto-compactions over 41 min of heavy traffic; memory 2/8 native,
+  **8/8 restored** from the append-only log.
+- [FastCompact.md](<docs/reports/FastCompact.md>) — follow-up run: **23 compactions**,
+  16/300 sampled D-IDs (chosen to exclude the reference run's 8) restored
+  **byte-exact via `recall`/`recall_search` only — 16/16 = 100% effective memory**
+  with zero file re-reads; final compact freed 14,656 tokens.
+- [compareRepor.md](<docs/reports/compareRepor.md>) — summary comparison of the two
+  runs: memory-context feature table and an 8-point fear-vs-truth review
+  (loss, confabulation, summary lag, search precision, …).
 
 ## License
 

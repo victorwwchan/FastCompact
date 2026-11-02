@@ -20,28 +20,29 @@
  */
 
 /**
- * Base-package keys the row may name. All but one ride to the official engine
- * untouched; `thresholdRatio` is translated per route (see below), so this plugin
- * never re-decides WHEN to compact — it only re-expresses the same share against
- * the window the routed request actually gets.
+ * Base-package keys the row may name. All ride to the official engine untouched —
+ * including `thresholdRatio`, which this plugin reads per route but never rewrites
+ * (see deriveRoutePressure): the row's share means the same thing on both sides, and
+ * the window it applies to is the one the routed request actually gets.
  */
 export const HOST_COMPACT_KEYS = Object.freeze([
   'thresholdRatio', 'retainRatio', 'retainTokens',
   'maxTokens', 'compactionRetries', 'maxOverflowRetries', 'modelPolicies', 'auto',
 ]);
 /**
- * NOTE — `thresholdRatio` is the one host key this plugin re-expresses per route.
- * The row states it as a share of the route's USABLE message budget (its window
- * minus the output reservation the provider charges to that same window), which
- * is what the number has always meant to the user ("fire at 90% of what the route
- * can actually carry"). The base multiplies its ratio by the RAW window, so on a
- * route like strata-llm/64KB (W=65,535 with O=32,000 reserved) forwarding 0.9
- * unchanged makes the gate collapse to the structural ceiling W - O - B (at most
- * 33,535 = 51% of the window even with no headroom at all — 47% on the margin we
- * derive), which is why a 0.9 row used to fire at half the window.
- * `applyDerivedHeadroom` rewrites that ratio per route (and sizes the headroom
- * under it) so the base's own formula lands exactly on
- * `floor((W - O) * thresholdRatio)`; see deriveRoutePressure.
+ * NOTE — `thresholdRatio` is the one host key this plugin reads per route, and it
+ * reads it in the base's OWN basis: a share of the route's RAW context window.
+ * That is the number the user means when they ask "compact at 80% of my context",
+ * and it is the percentage every report prints (the debug stats state usage as a
+ * share of the window), so one row number both sets and explains the firing point.
+ * The plugin's gate is then one comparison — `surfaceTokens >= ceil(W * ratio)`,
+ * with `surfaceTokens` read straight from the token meter (messages only; its
+ * envelope total also carries the route's tool schemas, which are a per-request
+ * constant no conversation can grow). Nothing else is calculated for the gate: no
+ * output reservation, no headroom, no budget-relative translation. What the row
+ * still needs per route is the BASE's own margin (its formula wants a headroom
+ * scaled to that window, and its default assumes a huge one) plus the facts this
+ * plugin reports about where the base lands — see deriveRoutePressure.
  */
 
 /** Keys this plugin owns (everything else in the row is a typo and fails). */
@@ -135,31 +136,53 @@ export function splitRowConfig(row) {
 }
 
 /**
- * Derive BOTH pressure keys of one exact route from that route's own capacity.
+ * Derive the pressure facts of one exact route from that route's own capacity.
  *
  * W = the route's adapter `contextWindow`, O = its adapter output default, and
- * U = W - O the message budget a routed request can actually carry. The base
- * gates at `floor(min(W * ratio, W - O - B))` — its ratio multiplies the RAW
- * window — so naming 0.9 on a 65,535/32,000 route asks for 58,981 message tokens,
- * which no request on that route can reach (U = 33,535): the gate silently falls
- * back to the structural ceiling U - B and compaction fires at ~half the window.
- * The row's ratio is a share of U instead, so this returns the pair the base must
- * be handed for ITS formula to land exactly on `floor(U * ratio)`:
+ * U = W - O the message budget a routed request can carry. The row's `thresholdRatio`
+ * is a share of W — the SAME basis every report prints (the debug stats state usage
+ * as a share of the window) — so the gate this plugin enforces is one number:
  *
- *   B      = min(share, budgetCap, U - floor(U * ratio))   (clamped to >= 1)
- *   gate   = min(floor(U * ratio), U - B)                  (tokens)
- *   ratio' = gate / W                                      (so W * ratio' == gate)
+ *   gate = min(ceil(W * thresholdRatio), ceiling)                (tokens of MESSAGES)
  *
- * `FastCompactEngine.compactIfNeeded` also re-checks this gate against
- * `measurement.surfaceTokens`, so the envelope's tool schemas never count toward it.
+ * Nothing but the route's own reachability touches it (one clamp to the ceiling, below). No output reservation, no headroom, no budget-relative no headroom, no budget-relative
+ * translation: `FastCompactEngine.compactIfNeeded` compares that gate against
+ * `measurement.surfaceTokens` from the token meter — the messages alone, with the
+ * route's tool schemas excluded by construction — so "compact at 80% of my window"
+ * means exactly that, and a small-window route is not quietly gated earlier because
+ * its schemas or its reply reservation got folded into the arithmetic.
+ *
+ * The headroom is still derived, but only for what we hand the BASE (its own formula
+ * needs a sane margin, and its default assumes a huge window); it never moves the
+ * gate above. What this function reports about the base is facts, not policy:
+ *
+ *   B              = min(share, budgetCap)                        (clamped to >= 1)
+ *   ceiling        = U - B                                        (the base's other term)
+ *   gate         = min(ceil(W * thresholdRatio), max(1, ceiling)) (clamped per route)
+ *   beyondBudget   = ceil(W * thresholdRatio) > U                                     (past the message budget)
+  *   clamped        = gate < ceil(W * thresholdRatio)              (share got clamped)
+ *   outputCap      = min(O, max(1024, W - gate))                   (the summary's own cap)
+ *
+ * `clamped` is what a share that high now means: the messages cannot hold ceil(W x
+ * share) tokens once the reply is reserved, so the gate lands at the LAST reachable
+ * step (the ceiling), instead of a gate that never fires at all: compaction still
+ * happens before the request overflows. The mount line and the stats block both name the
+ * share it wanted and the ceiling it had to use instead; `beyondBudget` adds that the share sits past U at all, so pressure here runs on borrowed time rather than on your own share.
+ *
+ * `outputCapTokens` is why the row no longer needs a hand-written `maxTokens`: the
+ * summary's output reservation follows the SAME share — what the gate leaves free of
+ * W is (W - gate), so the compaction request never asks for more than that (and never
+ * more than the adapter's own default). A row that still names `maxTokens` wins over
+ * this; leaving it out is what aligns it.
  *
  * @param {number} contextWindow - positive adapter capacity for one exact route.
- * @param {number|null} thresholdRatio - share of the message budget that applies
- *   to that route, or null when the row names none (then only share/cap apply and
- *   no ratio is returned, so the row's own value rides untouched).
+ * @param {number|null} thresholdRatio - share of the route's RAW context window
+ *   (the basis every report prints), or null when the row names none (then only the
+ *   margin is derived and no ratio or gate is returned, so the row's own value rides
+ *   untouched and the base governs its own decision).
  * @param {number} defaultMaxTokens - adapter output default (0 when unknown).
- * @param {number} headroomRatio - share of W to reserve (row knob).
- * @returns {{ headroomTokens: number, thresholdRatio: number | null }}
+ * @param {number} headroomRatio - share of W to reserve for the base (row knob).
+ * @returns {{ headroomTokens: number, thresholdRatio: number | null, gateTokens: number | null, ceilingTokens: number, requestedGateTokens: number | null, clampedToCeiling: boolean, beyondBudget: boolean, outputCapTokens: number | null }}
  */
 export function deriveRoutePressure(contextWindow, thresholdRatio = null, defaultMaxTokens = 0, headroomRatio = HEADROOM_RATIO) {
   if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
@@ -179,25 +202,53 @@ export function deriveRoutePressure(contextWindow, thresholdRatio = null, defaul
   if (budget <= 0) {
     // The route reserves its whole window for output: the base reports this itself
     // ("... leaving no message budget"), keep the margin minimal and name no ratio.
-    return { headroomTokens: 1, thresholdRatio: null };
+    return { headroomTokens: 1, thresholdRatio: null, gateTokens: null, requestedGateTokens: null, ceilingTokens: 0, clampedToCeiling: false, beyondBudget: false, outputCapTokens: null };
   }
   const share = Math.max(HEADROOM_MIN_TOKENS, Math.round(contextWindow * headroomRatio));
   const budgetCap = Math.max(1, Math.floor(budget * HEADROOM_MAX_BUDGET_SHARE));
   let headroom = Math.min(share, budgetCap);
-  if (thresholdRatio === null) return { headroomTokens: Math.max(1, headroom), thresholdRatio: null };
+  // No ratio named for this route: only the margin applies, and the row's own
+  // value (absent, so the base default governs) rides untouched.
+  if (thresholdRatio === null) {
+    return {
+      headroomTokens: Math.max(1, headroom),
+      thresholdRatio: null,
+      gateTokens: null,
+      requestedGateTokens: null,
+      ceilingTokens: Math.max(0, budget - headroom),
+      clampedToCeiling: false,
+      beyondBudget: false,
+      // With no share named there is no gate to align the summary cap to: the base's
+      // own output reservation governs, untouched.
+      outputCapTokens: null,
+    };
+  }
 
-  // The gate the row asks for, in tokens of that route's own message budget...
-  const target = Math.floor(budget * thresholdRatio);
-  // ... so the headroom must leave at least this much of the budget free, or the
-  // base's window-side term would silently replace the ratio the user named.
-  const margin = Math.max(1, budget - target);
-  headroom = Math.max(1, Math.min(headroom, margin));
-  const gate = Math.min(target, budget - headroom);
-  if (gate < 1) return { headroomTokens: 1, thresholdRatio: null };
-  // Hand the base back the equivalent window-relative ratio: its floor of
-  // W * this value is exactly `gate`, and U - headroom >= gate keeps the other
-  // term from binding.
-  return { headroomTokens: headroom, thresholdRatio: gate / contextWindow };
+  // The gate is the row's share of W, and that is all: the meter prices the MESSAGES
+  // against it, so neither the output reservation nor the headroom enters the decision.
+  // `ceil` so a session sitting exactly at that share is already ON the gate; the
+  // ceiling only says how high messages can ever climb once the reply is reserved.
+  const requestedGateTokens = Math.ceil(contextWindow * thresholdRatio);
+  const ceilingTokens = budget - headroom;
+  // A share the messages can physically never reach stops being a never-firing gate:
+  // it clamps to the last reachable step, so compaction still happens before the
+  // request overflows (the clamp is reported, and the row's share is untouched).
+  const gateTokens = Math.min(requestedGateTokens, Math.max(1, ceilingTokens));
+  // The summary's output cap follows the EFFECTIVE gate: what the gate leaves free of W
+  // is (W - gate), so the compaction request never asks for more than that, and never
+  // more than what the adapter itself declared. A row that names `maxTokens` still wins —
+  // this is only what fills its place when the row leaves the knob out.
+  const gateLeavesFree = Math.max(HEADROOM_MIN_TOKENS, contextWindow - gateTokens);
+  return {
+    headroomTokens: headroom,
+    thresholdRatio,
+    gateTokens,
+    requestedGateTokens,
+    ceilingTokens,
+    clampedToCeiling: gateTokens < requestedGateTokens,
+    beyondBudget: requestedGateTokens > budget,
+    outputCapTokens: defaultMaxTokens > 0 ? Math.min(defaultMaxTokens, gateLeavesFree) : gateLeavesFree,
+  };
 }
 
 /** The headroom half of deriveRoutePressure (kept as the tested standalone name). */
@@ -215,7 +266,7 @@ export function deriveHeadroomTokens(contextWindow, thresholdRatio = null, defau
  * still gets a sane margin. A missing table falls back to the documented
  * constant — never to the base default, which assumes a huge window.
  * @param {object} host - host half of the row (never mutated).
- * @param {{ topLevel: number, perRoute: object[] }} derived - table from `index.mjs`.
+ * @param {{ topLevel: number, topLevelThresholdRatio: number|null, topLevelOutputCap: number|null, perRoute: object[] }} derived - table from `index.mjs`; each `perRoute` entry may carry `outputCapTokens`, which lands as that policy's `maxTokens`. A row (or policy) that hand-set `maxTokens` keeps its own value — the aligned cap only fills the place where the knob was left out.
  */
 export function applyDerivedHeadroom(host, derived) {
   const policies = Array.isArray(host.modelPolicies)
@@ -231,6 +282,9 @@ export function applyDerivedHeadroom(host, derived) {
   if (!Number.isInteger(topLevel) || topLevel < 1) {
     throw new Error(`dsh-fast-compact config: derivedHeadroom.topLevel (${String(derived.topLevel)}) must be an integer >= 1`);
   }
+  // Does the row itself own the summary cap? Then nothing derived touches it, at any
+  // level: a hand-written maxTokens is the user's decision, top-level or per-policy.
+  const rowOwnsCap = Number.isInteger(host.maxTokens) && host.maxTokens >= 1;
   const perRoute = new Map();
   for (const [index, entry] of (derived.perRoute ?? []).entries()) {
     if (typeof entry !== 'object' || Array.isArray(entry)) {
@@ -243,18 +297,29 @@ export function applyDerivedHeadroom(host, derived) {
     if ('thresholdRatio' in entry && (typeof entry.thresholdRatio !== 'number' || !(entry.thresholdRatio > 0 && entry.thresholdRatio <= 1))) {
       throw new Error(`dsh-fast-compact config: derivedHeadroom.perRoute[${index}].thresholdRatio must be a number in (0, 1]`);
     }
+    if ('outputCapTokens' in entry && (!Number.isInteger(entry.outputCapTokens) || entry.outputCapTokens < 1)) {
+      throw new Error(`dsh-fast-compact config: derivedHeadroom.perRoute[${index}].outputCapTokens must be an integer >= 1`);
+    }
     // Only keys the base's modelPolicies schema admits — capacity facts the entry
     // may also carry stay out of the row and live on the engine for reporting.
     const policy = { provider, model, headroomTokens: entry.headroomTokens };
     if ('thresholdRatio' in entry) policy.thresholdRatio = entry.thresholdRatio;
+    if (!rowOwnsCap && 'outputCapTokens' in entry) policy.maxTokens = entry.outputCapTokens;
     perRoute.set(`${provider}/${model}`, policy);
   }
-  // The default ratio for routes the table never named: translated with the same
-  // derivation against the tightest window we read (index.mjs), so an unlisted
-  // route still gates at its own share of its usable budget rather than of W.
+  // The default ratio for routes the table never named: the row's own share, sized
+  // against the tightest window we read (index.mjs), so an unlisted route still
+  // gates at its own share of W rather than inheriting a margin computed for a
+  // bigger route. The basis is the window's, so nothing here is re-expressed.
   const topLevelRatio = derived.topLevelThresholdRatio;
   if (topLevelRatio !== undefined && topLevelRatio !== null && !(typeof topLevelRatio === 'number' && topLevelRatio > 0 && topLevelRatio <= 1)) {
     throw new Error(`dsh-fast-compact config: derivedHeadroom.topLevelThresholdRatio (${String(topLevelRatio)}) must be a number in (0, 1]`);
+  }
+  // The summary cap for routes the table never named, sized from the same share at
+  // the tightest window we read (index.mjs). A row that hand-set maxTokens still wins.
+  const topLevelOutputCap = derived.topLevelOutputCap;
+  if (topLevelOutputCap !== undefined && topLevelOutputCap !== null && (!Number.isInteger(topLevelOutputCap) || topLevelOutputCap < 1)) {
+    throw new Error(`dsh-fast-compact config: derivedHeadroom.topLevelOutputCap (${String(topLevelOutputCap)}) must be an integer >= 1`);
   }
   const merged = policies.map((policy) => {
     const own = perRoute.get(`${policy.provider ?? ''}/${policy.model ?? ''}`);
@@ -262,6 +327,8 @@ export function applyDerivedHeadroom(host, derived) {
     if (own?.thresholdRatio !== undefined || topLevelRatio !== undefined) {
       next.thresholdRatio = own?.thresholdRatio ?? policy.thresholdRatio ?? topLevelRatio;
     }
+    const derivedCap = own?.maxTokens ?? topLevelOutputCap;
+    if (!rowOwnsCap && derivedCap !== undefined && next.maxTokens === undefined) next.maxTokens = derivedCap;
     return next;
   });
   const seen = new Set(policies.map((policy) => `${policy.provider ?? ''}/${policy.model ?? ''}`));
@@ -274,6 +341,8 @@ export function applyDerivedHeadroom(host, derived) {
   // The top-level ratio only lands when the table could translate it; with no
   // capacity service at all the row's own value rides to the base untouched.
   if (topLevelRatio !== undefined && topLevelRatio !== null) hostOut.thresholdRatio = topLevelRatio;
+  // Same for the summary cap: only a row that left maxTokens out gets the aligned one.
+  if (host.maxTokens === undefined && topLevelOutputCap !== undefined && topLevelOutputCap !== null) hostOut.maxTokens = topLevelOutputCap;
   return hostOut;
 }
 

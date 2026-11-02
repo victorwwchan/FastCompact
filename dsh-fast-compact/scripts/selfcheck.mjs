@@ -236,32 +236,40 @@ await check('mount: headroom AND the ratio are derived per route from that route
     },
   });
   const fiber = ctx.plugin(indexMod, {
-    harnessEntry: entry, thresholdRatio: 0.7, retainRatio: 0.12, maxTokens: 8192,
+    harnessEntry: entry, thresholdRatio: 0.7, retainRatio: 0.12,
     modelPolicies: [{ provider: 'llama-cpp', model: '84k', retainRatio: 0.2 }],
   });
   await fiber;
   await settle();
   const config = ctx.get('compaction').config;
-  // The row's 0.7 is a share of each route's MESSAGE BUDGET, so no shrink race is
-  // needed anywhere: the 4% headroom always fits under the 30% the ratio leaves free.
+  // The row's 0.7 is a share of each route's WINDOW, so no shrink race is needed
+  // anywhere: the 4% headroom always fits under the 30% the ratio leaves free.
   assert.equal(config.headroomTokens, 2_621, 'row-level headroom derived from the tightest window read');
-  // Unlisted routes get the default translated against the tightest window read
-  // (65,535; its output default is unknown, so none is reserved): floor(0.7 * W).
+  // Unlisted routes get the row's ratio untouched — there is nothing left to translate,
+  // because the plugin reads that share against the window the session actually rode.
   assert.ok(config.thresholdRatio !== undefined && config.thresholdRatio > 0 && config.thresholdRatio <= 1, 'a route ratio is present');
-  assert.equal(config.thresholdRatio, Math.floor(65_535 * 0.7) / 65_535, 'default ratio is the translated window-relative form of that gate');
+  assert.equal(config.thresholdRatio, 0.7, 'the row ratio rides into the host half verbatim, as a share of the WINDOW');
   const policies = config.modelPolicies.map((policy) => ({ ...policy }));
   assert.deepEqual(policies.map((policy) => `${policy.provider}/${policy.model}`).sort(), ['llama-cpp/84k', 'strata-llm/120KB', 'strata-llm/64KB'], 'every readable route got a policy of its own');
   const byRoute = new Map(policies.map((policy) => [`${policy.provider}/${policy.model}`, policy]));
-  // Re-run the BASE's own gate formula with each policy pair: it must land on floor((W-O)*0.7),
-  // which is what the user means by "compact at 70%" on a route that reserves output.
+  // Re-run the BASE's own gate formula with each policy pair: the plugin hands it the row's
+  // share verbatim, so the base lands on the WINDOW share whenever it fits, and on the
+  // structural ceiling (budget minus the margin) when the share sits past that budget.
   const baseGate = (policy, window, output) => Math.floor(Math.min(window * policy.thresholdRatio, window - output - policy.headroomTokens));
-  assert.equal(byRoute.get('strata-llm/120KB').headroomTokens, 4_915, 'headroom stays at the honest 4% share (no shrink needed for a budget-relative ratio)');
-  assert.equal(baseGate(byRoute.get('strata-llm/120KB'), 122_880, 32_000), Math.floor((122_880 - 32_000) * 0.7), 'gate = 70% of the 90880-token message budget');
+  assert.equal(byRoute.get('strata-llm/120KB').headroomTokens, 4_915, 'headroom stays at the honest 4% share (no shrink needed for a window-relative ratio)');
+  assert.equal(baseGate(byRoute.get('strata-llm/120KB'), 122_880, 32_000), 122_880 - 32_000 - 4_915, 'the base lands on its ceiling (budget minus margin): the window share 86,016 sits a hair past 85,965, and this plugin clamps its own gate to that same ceiling');
   assert.equal(byRoute.get('strata-llm/64KB').headroomTokens, 2_621, 'the tight route keeps its own 4% share');
-  assert.equal(baseGate(byRoute.get('strata-llm/64KB'), 65_535, 32_000), Math.floor((65_535 - 32_000) * 0.7), 'and its gate is 70% of ITS 33535-token budget, not 70% of the window');
+  assert.equal(baseGate(byRoute.get('strata-llm/64KB'), 65_535, 32_000), 65_535 - 32_000 - 2_621, 'its window share sits past the 33,535-token message budget, so the base rides its ceiling (engine.mjs reports this as beyondBudget)');
   assert.equal(baseGate(byRoute.get('llama-cpp/84k'), 84_000, 0), Math.floor(84_000 * 0.7), 'a route with no output default keeps the ratio unchanged');
   assert.equal(byRoute.get('llama-cpp/84k').retainRatio, 0.2, 'the row\'s own policy keys survived the merge');
   assert.ok(!byRoute.get('llama-cpp/84k').hasOwnProperty('contextWindow'), 'capacity facts stay out of the base\'s policy schema');
+  // The row left maxTokens out, so the summary's output cap follows each route's own
+  // share: min(that adapter's default, W - gate), and the top-level value comes from
+  // the tightest window read.
+  assert.equal(config.maxTokens, 19_660, 'no row maxTokens: the aligned cap fills it from the tightest window (65,535 - gate 45,875)');
+  assert.equal(byRoute.get('strata-llm/120KB').maxTokens, 32_000, 'that route\'s adapter default was the tighter term (the clamped gate 85,965 leaves 36,915 free of W)');
+  assert.equal(byRoute.get('strata-llm/64KB').maxTokens, 32_000, 'the clamp moved its gate to 30,914, so the free term (34,621) is looser than the adapter\'s own 32,000');
+  assert.equal(byRoute.get('llama-cpp/84k').maxTokens, 25_200, 'no adapter output default: the cap is simply W - gate');
   await fiber.dispose();
   await settle();
 });

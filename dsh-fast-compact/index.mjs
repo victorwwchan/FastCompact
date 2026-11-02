@@ -82,27 +82,38 @@ function headroomRatioValue(value) {
 const MAX_ENUMERATED_MODELS = 64;
 
 /**
- * Read every route's capacity through the llm service and derive its pressure pair
- * (headroom + window-relative ratio). The row's `thresholdRatio` is a share of the
- * route's USABLE message budget (W - O); the base multiplies its ratio by the RAW
- * window, so each route needs its own translated ratio and a headroom small enough
- * to leave that gate reachable — a fixed count or a fixed ratio is wrong for
- * everything but one window size. Routes are catalog-driven: adapters answer
- * without any request; an endpoint that cannot be interrogated keeps the fallback.
+ * Read every route's capacity through the llm service and derive its pressure
+ * facts. The row's `thresholdRatio` is a share of that route's RAW context
+ * window — the same basis the base multiplies — so it rides untouched and needs
+ * no per-route translation; what differs per route is the headroom (sized from
+ * that window, so the base's own formula carries a margin that fits it) and the
+ * gate this plugin enforces: `min(ceil(W * ratio), ceiling)` tokens of MESSAGES, where
+ * `ceiling = (W - O) - B` is the highest the messages can climb once the reply and the
+ * margin are reserved — the meter's surface reading is compared against that. A share
+ * that clamps is reported (`clampedToCeiling`, plus `beyondBudget` when it sits past the
+ * message budget), so the mount line shows both the share wanted and the gate used.
+ * Routes are catalog-driven: adapters answer without any request; an endpoint that cannot
+ * be interrogated keeps the fallback.
  * @param {object} ctx - cordis context inside the compaction isolate realm.
  * @param {{ thresholdRatio?: number, modelPolicies?: object[] }} row - host half of the row.
  * @param {number} headroomRatio - share of each window to reserve.
- * @returns {{ topLevel: number, topLevelThresholdRatio: number|null, perRoute: object[] } | null}
+ * @returns {{ topLevel: number, topLevelThresholdRatio: number|null, topLevelOutputCap: number|null, perRoute: object[] } | null}
  *   - null = no capacity service; perRoute entries carry provider/model plus the
- *   derived headroomTokens/thresholdRatio and the raw contextWindow/defaultMaxTokens
- *   the engine reports in its debug stats.
+ *   derived headroomTokens/thresholdRatio/outputCapTokens (which lands as that
+ *   policy's maxTokens), the raw contextWindow/defaultMaxTokens the engine reports
+ *   in its debug stats, and gateTokens/requestedGateTokens/clampedToCeiling/beyondBudget —
+ *   the gate that actually governs that route, the raw share it wanted, and how far that
+ *   share had to move (plus whether it sits past the message budget at all). The summary
+ *   cap follows the EFFECTIVE gate (what it leaves free of W), so the row itself needs no
+ *   maxTokens.
  */
 async function resolveHeadroomTable(ctx, row, headroomRatio) {
   const llm = ctx?.get?.('llm') ?? ctx?.llm;
   if (llm === undefined || typeof llm.resolveModelInfo !== 'function') return null;
 
-  // Which ratio applies to which route decides whether the derived headroom is
-  // shrunk so that ratio actually governs the gate.
+  // Which ratio applies to which route: a modelPolicies entry may name its own
+  // share of that route's window, and only that route's ceiling can then clamp
+  // it.
   const rowRatio = typeof row.thresholdRatio === 'number' ? row.thresholdRatio : null;
   const ratios = new Map();
   if (Array.isArray(row.modelPolicies)) {
@@ -164,6 +175,11 @@ async function resolveHeadroomTable(ctx, row, headroomRatio) {
           defaultMaxTokens: info.defaultMaxTokens ?? 0,
           headroomTokens: pressure.headroomTokens,
           ...(pressure.thresholdRatio === null ? {} : { thresholdRatio: pressure.thresholdRatio }),
+          ...(pressure.gateTokens === null ? {} : { gateTokens: pressure.gateTokens }),
+          ...(pressure.requestedGateTokens === null ? {} : { requestedGateTokens: pressure.requestedGateTokens }),
+          ...(pressure.clampedToCeiling ? { clampedToCeiling: true } : {}),
+          ...(pressure.beyondBudget ? { beyondBudget: true } : {}),
+          ...(pressure.outputCapTokens === null ? {} : { outputCapTokens: pressure.outputCapTokens }),
         });
         windows.push(contextWindow);
       } catch (error) {
@@ -172,17 +188,18 @@ async function resolveHeadroomTable(ctx, row, headroomRatio) {
     }
   }
 
-  // The default for routes the table does not name: margin and ratio sized for the
-  // TIGHTEST window we read, so an unlisted route can never carry a headroom bigger
-  // than its own budget, nor a ratio whose gate it could not reach. With no output
-  // default known for that hypothetical route, O = 0 keeps the share honest (a
-  // window-relative ratio identical to the row's).
+  // The default for routes the table does not name: margin sized for the TIGHTEST
+  // window we read, so an unlisted route can never carry a headroom bigger than its
+  // own budget. The ratio is a share of W — a basis every window shares — so it rides
+  // at the row's own value; the summary cap follows that same share at the tightest
+  // window (O = 0 there, so nothing is invented for an unnamed route's output default).
   const tightest = windows.reduce((min, window) => Math.min(min, window), Number.MAX_SAFE_INTEGER);
-  if (windows.length === 0) return { topLevel: HEADROOM_FALLBACK_TOKENS, topLevelThresholdRatio: null, perRoute };
+  if (windows.length === 0) return { topLevel: HEADROOM_FALLBACK_TOKENS, topLevelThresholdRatio: null, topLevelOutputCap: null, perRoute };
   const topPressure = deriveRoutePressure(tightest, rowRatio, 0, headroomRatio);
   return {
     topLevel: topPressure.headroomTokens,
     topLevelThresholdRatio: topPressure.thresholdRatio,
+    topLevelOutputCap: topPressure.outputCapTokens,
     perRoute,
   };
 }
@@ -261,21 +278,31 @@ export async function apply(ctx, config = {}) {
     commandCtx.effect(() => registerCommands(commandCtx, budgets, warn), `${name} commands`);
   });
 
-  // Mount log states the ACTUAL gate each route now fires at, in tokens and as a
-  // share of both the raw window and the usable message budget — the numbers the
-  // row's ratio translates to, so a "0.9 that fires at 0.5" report is answerable
-  // from one line instead of by re-deriving the base's formula.
+  // Mount log states the ACTUAL gate each route now fires at, as a share of the RAW
+  // window — the very basis the row's ratio names, so a "why did it fire here" report
+  // is answerable from one line. The gate is the meter's surface reading against that
+  // number; a share past what the messages can hold once the reply is reserved is
+  // clamped to that ceiling (pressure then fires at the last reachable step), and the
+  // line names BOTH numbers so the clamp is visible rather than inferred.
   const rowRatioForLabel = typeof engineRow.thresholdRatio === 'number' ? engineRow.thresholdRatio : null;
   const gateOf = (entry) => {
-    const budget = entry.contextWindow - (entry.defaultMaxTokens ?? 0);
-    if (typeof entry.thresholdRatio === 'number') return Math.floor(entry.contextWindow * entry.thresholdRatio);
-    const target = rowRatioForLabel === null ? null : Math.floor(budget * rowRatioForLabel);
-    return Math.min(target ?? Number.MAX_SAFE_INTEGER, budget - entry.headroomTokens);
+    if (typeof entry.gateTokens === 'number') return entry.gateTokens;
+    const ratio = typeof entry.thresholdRatio === 'number' ? entry.thresholdRatio : rowRatioForLabel;
+    if (ratio === null) return null;
+    return Math.ceil(entry.contextWindow * ratio);
   };
   const pressureLabel = (entry) => {
-    const budget = entry.contextWindow - (entry.defaultMaxTokens ?? 0);
     const gate = gateOf(entry);
-    return `${entry.provider}/${entry.model} W=${entry.contextWindow} O=${entry.defaultMaxTokens ?? 0} headroom ${entry.headroomTokens} -> gate ${gate} tok (${((gate / entry.contextWindow) * 100).toFixed(1)}% of W, ${((gate / budget) * 100).toFixed(1)}% of the ${budget}-token message budget)`;
+    if (gate === null) {
+      return `${entry.provider}/${entry.model} W=${entry.contextWindow} -> no row ratio named, the base default governs`;
+    }
+    const window = entry.contextWindow;
+    const share = ((gate / window) * 100).toFixed(1);
+    const requested = typeof entry.requestedGateTokens === 'number' ? entry.requestedGateTokens : gate;
+    const clampNote = requested > gate
+      ? ` (the row wanted ${((requested / window) * 100).toFixed(1)}% of W = ${requested} tok, its messages top out at ${gate})`
+      : '';
+    return `${entry.provider}/${entry.model} W=${window} -> gate ${share}% of W (${gate} tok)${clampNote}`;
   };
   const perRoute = headroomTable?.perRoute ?? [];
   const headroomSummary = headroomTable === null
@@ -284,9 +311,9 @@ export async function apply(ctx, config = {}) {
         const listed = perRoute.slice(0, 8).map(pressureLabel).join('; ');
         const more = perRoute.length > 8 ? `; +${perRoute.length - 8} more route(s)` : '';
         const ratioNote = headroomTable.topLevelThresholdRatio === null
-          ? `no route ratio named (the base default governs unlisted routes)`
-          : `thresholdRatio is a share of each message budget (${rowRatioForLabel === null ? 'base default' : rowRatioForLabel} where the row names none)`;
-        return `pressure derived per window (${(headroomRatio * 100).toFixed(1)}% headroom, budget-capped): default headroom ${headroomTable.topLevel}; ${ratioNote}; ${perRoute.length} route(s): ${listed}${more}`;
+          ? 'no route ratio named (the base default governs unlisted routes)'
+          : `thresholdRatio is a share of the RAW window (${rowRatioForLabel === null ? 'base default' : rowRatioForLabel} where the row names none)`;
+        return `pressure gates as shares of each window: ${ratioNote}; ${perRoute.length} route(s): ${listed}${more}`;
       })();
 
   ctx.logger.info(

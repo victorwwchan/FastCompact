@@ -2,27 +2,6 @@ MIT License
 
 Copyright (c) 2026 vicschan
 
-This package is an independent implementation owned by vicschan. Its engine
-subclasses the public API of the official DSH compaction packages
-(@deepseek-ai/dsh-compaction and @deepseek-ai/dsh-compaction-basic), which it
-resolves from the running DSH install at runtime; no source of theirs is copied
-or bundled into this package — resolution happens at mount.
-
-No vendored or third-party compaction library is used, imported, bundled or
-depended upon. This package declares no npm dependencies, its node_modules holds
-only pnpm bookkeeping files, and every non-Node import in index.mjs, lib/,
-scripts/ and test/ resolves either to a module of this package or to an official
-@deepseek-ai/dsh-* host package.
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

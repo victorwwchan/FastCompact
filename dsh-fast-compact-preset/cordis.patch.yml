@@ -74,13 +74,13 @@
             config:
               - id: fast-compact
                 name: dsh-fast-compact
-                # All keys are optional. BOTH pressure keys are DERIVED per route: headroomTokens AND the
-                # window-relative thresholdRatio (knob: headroomRatio) — the row carries neither; see README.
+                # All keys are optional. Only ONE pressure knob is a context decision: thresholdRatio, a
+                # SHARE OF THE ROUTE'S RAW CONTEXT WINDOW (see the comment below); headroomTokens and the summary cap (maxTokens) are derived per route and never written here — headroomTokens only sizes the base's own margin, it never gates.
+                # a headroomTokens you write here (top level or inside one modelPolicies entry) fails at mount, and says so.
                 config:
                   # --- pressure/retention half: owned by @deepseek-ai/dsh-compaction-basic, forwarded untouched ---
-                  thresholdRatio: 0.8            # SHARE OF THE MESSAGE BUDGET (W-O), not of the window, and it governs the MESSAGES only: the plugin re-expresses it per route so the gate lands on floor((W-O)*ratio) and the engine re-checks that gate against the message surface, so the route's tool schemas can never pre-fill it. On strata-llm/64KB (W=65535 O=32000) 0.8 gates at 26,828 tokens = 40.9% of W; at 0.9 it would be 30,181 tokens = 46.1% of W.
-                  retainRatio: 0.12              # tail kept verbatim: floor((W-O) x this); must stay below the gate above
-                  maxTokens: 8192                # summary output cap (omit it and the base reuses the derived headroom)
+                  thresholdRatio: 0.8            # SHARE OF THE RAW WINDOW (W), not of a budget: the plugin gates on the meter's message-only surface, so pressure fires once the MESSAGES alone reach ceil(W x this). On strata-llm/120KB (W=122880) that is 86,016 tokens = 70.0% of W — and messages can hold at most 90,880 there (32,000 are reserved for the reply), so a share above 0.74 on that route clamps to its reachable ceiling (85,965 tokens = 69.9% of W): pressure fires at that last step before the request overflows, and both the mount line and the stats block print the share it wanted next to it. The tool schemas this route's header carries (~7.6k tokens) are priced by the meter but never counted here, so they cannot pre-fill the gate.
+                  retainRatio: 0.12              # tail kept verbatim: the BASE sizes it as floor((W-O) x this) and must keep it below whatever gate governs; this row's own after-share is contextMaxRatio below
                   compactionRetries: 1           # extra pressure attempts after the first
                   maxOverflowRetries: 1          # retries once on a model-request overflow
                   auto: true                     # register automatic pressure + overflow compaction
@@ -94,23 +94,26 @@
                   debugChars: 400                # per-entry cap for that trail's error text ONLY, in chars (the stats block is not sized by it; debug false = neither block)
                   # plugin-level keys (optional): harnessEntry, allowUntestedHarness, recallToolName, searchToolName, maxRecallChars, maxSearchHits, headroomRatio
                   # removed legacy keys: maxRequestBytes, targetRequestBytes, contextRatio, retainTurns, retainBytes, keepRecentImages, dryRun, toolRefs, refKeyArg, refThoughtChars, lastThinkingMode, sessionLogInstruction (our `debug` is re-claimed: it now means the failed-call trail AND the window-accounting block above, not hypercompact's old flag)
-                  # derived per route at mount (never written here): headroomTokens (4% of that route's window, capped) AND thresholdRatio = the SAME gate expressed against W, so the base formula lands on floor((W-O)*row ratio)
+                  # derived per route at mount (never written here): headroomTokens (4% of that route's window,
+                  # capped so it can never eat more than a quarter of what its messages can hold) AND the summary's output cap — maxTokens = min(that route's adapter default, W - gate), so it follows the share you set above; this row writes none.
+                  # headroomTokens only sizes the base's OWN margin; the row's thresholdRatio gates, untouched, as a share of W. A maxTokens you still hand-write wins over the derived cap.
                   
                   
                   #modelPolicies:
                   #  # Per-route overrides: provider and model id must match the live route exactly
                   #  # (they come from the request header, not from persona or display name).
-                  #  # W = contextWindow declared on that adapter model; O = its request output cap.
-                  #  # Headroom AND the ratio are derived per route from that route's own W and O; a ratio named here is still a share of (W-O).
+                  #  # W = contextWindow declared on that adapter model; O = its request output cap. A ratio named
+                  #  # here is a share of THAT route's W; what messages can at most hold is (W-O), so the biggest
+                  #  # share that is still a pressure gate is (W-O)/W — every number below respects that ceiling. The summary's output cap (maxTokens) is derived from each entry's own share — never written here.
                   #  - provider: strata-llm        # default route of the web profile
-                  #    model: 120KB                # budget 90880 -> headroom 4915, gate floor(0.7*90880) = 63,616 tokens = 51.8% of W
+                  #    model: 120KB                # W=122880 O=32000 -> messages top out at 90880 (73.9% of W): gate ceil(0.7*W) = 86,016 tokens = 70.0% of W
                   #    thresholdRatio: 0.7
                   #  - provider: strata-llm
-                  #    model: 100KB                # budget 70400 -> headroom 4096, gate floor(0.65*70400) = 45,760 tokens = 44.7% of W
+                  #    model: 100KB                # W=102400 O=32000 -> messages top out at 70400 (68.8% of W): gate ceil(0.65*W) = 66,560 tokens = 65.0% of W
                   #    thresholdRatio: 0.65
-                  #  - provider: strata-llm        # the tight route: 0.9 here gates at 30,181 tokens, NOT at ~33k (51% of W)
-                  #    model: 64KB                 # budget 33535 -> headroom 2621, gate floor(0.9*33535) = 30,181 tokens = 46.1% of W
-                  #    thresholdRatio: 0.9
+                  #  - provider: strata-llm        # the tight route: 0.8 is 52,428 tokens, PAST what its messages can hold (33,535 = 51.2% of W): the gate clamps to that ceiling (30,914 tokens) and prints both shares
+                  #    model: 64KB                 # W=65535 O=32000 -> gate min(ceil(0.8*W), reachable ceiling 30,914) = 30,914 tokens = 47.2% of W (clamped from 80%)
+                  #    thresholdRatio: 0.8
       
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'

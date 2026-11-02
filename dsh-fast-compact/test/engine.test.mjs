@@ -309,14 +309,17 @@ test('engine: the debug knob prices the window and states what actually gated', 
   assert.equal(stats.shadowedTokens, expectedShadowed, 'shadowed tokens are the meter\'s own per-node prices');
   assert.equal(stats.beforeTokens, expectedBefore, 'the before figure is the surface as priced, node for node');
 
-  // The gate the base actually used: derived headroom plus the translated ratio,
-  // run through the base's formula, must land on the row's share of the MESSAGE
-  // BUDGET — 90% of 33,535 on a 65,535-window route, not 90% of the window.
+  // The gate the plugin enforces: the row's share of the WINDOW, clamped to what the
+  // messages can hold once the reply is reserved — 90% of 65,535 on this route sits
+  // past its message budget, so pressure fires at the last reachable step instead.
   const entry = engine.pressureTable.perRoute[0];
   assert.equal(entry.headroomTokens, deriveRoutePressure(65_535, 0.9, 32_000).headroomTokens, 'the route\'s derived headroom');
   assert.equal(stats.outputReserved, 32_000, 'and its reserved output come from the adapter, not the row');
   assert.equal(stats.messageBudget, 33_535, 'the usable message budget of that route');
-  assert.equal(stats.gateTokens, Math.floor((65_535 - 32_000) * 0.9), 'gate = 90% of the budget, exactly as the row asked');
+  assert.equal(stats.requestedGateTokens, Math.ceil(65_535 * 0.9), 'the raw 90% share of the WINDOW, reported untouched');
+  assert.equal(stats.gateTokens, 30_914, 'clamped to the 33,535-token budget minus its 2,621-token headroom: pressure fires at the last reachable step');
+  assert.ok(stats.clampedToCeiling === true, 'and the clamp is visible in the stats, not hidden');
+  assert.equal(stats.beyondBudget, true, 'that share sits past the 33,535-token message budget: pressure here runs on borrowed time');
   assert.ok(stats.route === 'p/m', 'the block names the route that gated this compaction');
 
   // Internal consistency of the accounting line itself.
@@ -365,8 +368,15 @@ test('engine: the debug knob prices the window and states what actually gated', 
 
 test('engine: the pressure gate governs the MESSAGES, not the envelope of tool schemas', { skip }, async () => {
   const routePressure = deriveRoutePressure(65_535, 0.9, 32_000);
-  const gate = Math.floor((65_535 - 32_000) * 0.9);
-  const toolsTokens = 12_000; // the fixture's messages alone sit under the gate; with schemas the envelope passes it
+  // Our gate is the row's share of the WINDOW (58,982 on W=65,535), read against the
+  // meter's surface-only reading. The base instead decides on its own envelope
+  // threshold — the same share capped at the message budget minus the derived margin
+  // (33,535 - 2,621 = 30,914 here) — so a fixture whose MESSAGES sit between those two
+  // numbers is exactly where the base alone would compact and this plugin must not.
+  const ourGate = Math.ceil(65_535 * 0.9);
+  const baseGate = 33_535 - routePressure.headroomTokens;
+  assert.ok(ourGate > baseGate, 'the window share sits past what the envelope threshold can reach');
+  const toolsTokens = 16_000; // the fixture's messages alone sit under our gate; with schemas the envelope passes the base's
   const mounted = await fcSetup({
     thresholdRatio: 0.9,
     retainRatio: 0.12,
@@ -380,18 +390,21 @@ test('engine: the pressure gate governs the MESSAGES, not the envelope of tool s
     },
   }, {}, toolsTokens);
   const measurement = mounted.engine.ctx.tokenMeter.measure();
-  assert.ok(measurement.totalTokens >= gate, 'the envelope alone is over the gate, so the base alone would compact here');
-  assert.ok(measurement.surfaceTokens < gate, 'while the messages still sit under it');
+  assert.ok(measurement.totalTokens >= baseGate, 'the envelope alone is over the base\'s own threshold, so the base alone would compact here');
+  assert.ok(measurement.surfaceTokens < ourGate, 'while the messages still sit under the row\'s share of the window');
   const result = await mounted.engine.compactIfNeeded(mounted.agent, 'pressure', new AbortController().signal);
   assert.equal(result, null, 'and nothing compacted: the row\'s share governs the MESSAGES');
 });
 
 test('engine: a route the mount table never named still gets its real gate', { skip }, async () => {
   const routePressure = deriveRoutePressure(65_535, 0.9, 32_000);
-  const gate = Math.floor((65_535 - 32_000) * 0.9);
   // perRoute EMPTY: the profile's capacities were not readable while the plugin
-  // mounted (the web GUI loads providers after mounting), so the base alone would
-  // decide on an untranslated window-relative default and compact far too early.
+  // mounted (the web GUI loads providers after mounting), so nothing could name a
+  // gate at mount. learnRoute reads the window straight from the session — the
+  // requestContext() the meter prices against — at compaction time instead, and the
+  // row's share of THAT window gates the messages, untouched by any reservation.
+  const ourGate = Math.ceil(65_535 * 0.9);
+  const baseGate = 33_535 - routePressure.headroomTokens;
   const mounted = await fcSetup({
     thresholdRatio: 0.9,
     retainRatio: 0.12,
@@ -405,13 +418,16 @@ test('engine: a route the mount table never named still gets its real gate', { s
     },
   }, {}, 12_000);
   const measurement = mounted.engine.ctx.tokenMeter.measure();
-  assert.ok(measurement.totalTokens >= gate, 'the envelope alone is over the gate');
-  assert.ok(measurement.surfaceTokens < gate, 'while the messages still sit under it');
+  assert.ok(measurement.totalTokens >= baseGate, 'the envelope alone is over the base\'s own threshold');
+  assert.ok(measurement.surfaceTokens < ourGate, 'while the messages still sit under the row\'s share of the window');
   const result = await mounted.engine.compactIfNeeded(mounted.agent, 'pressure', new AbortController().signal);
   assert.equal(result, null, 'the gate was learned at compaction time, so nothing compacted');
   const learned = [...mounted.engine.routeGates.values()];
   assert.equal(learned.length, 1, 'one route learned through ctx.llm on demand');
   assert.ok(learned[0].route === 'p/m', 'named from the session request header');
   assert.equal(learned[0].contextWindow, 65_535, 'capacity read from the adapter metadata');
-  assert.equal(learned[0].gateTokens, gate, 'derived as 90% of the MESSAGE BUDGET, not of the window');
+  assert.equal(learned[0].gateTokens, routePressure.gateTokens, 'the row\'s share of the WINDOW, clamped to what its messages can hold');
+  assert.equal(learned[0].requestedGateTokens, Math.ceil(65_535 * 0.9), 'the raw share is carried beside it, untouched');
+  assert.ok(learned[0].clampedToCeiling === true, 'and the clamp that moved it is visible on the learned gate');
+  assert.equal(learned[0].beyondBudget, true, 'that share sits past the message budget, so pressure here runs on borrowed time');
 });

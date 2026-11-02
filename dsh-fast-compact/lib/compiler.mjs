@@ -728,14 +728,19 @@ export function shareOf(numerator, denominator) {
  * The debug window-accounting block (row knob `debug`): a usage line — the
  * cheapest possible read of "what did this compaction do to my window" — usage
  * before and after as a share of the window, plus the gate that governs the next
- * one and the tool-schema overhead the gate never counts. Every figure comes from
- * the engine's own measurement (`contextStats`, against the token meter and the
- * derived pressure table), never a guess; a route whose capacity could not be read
- * says `n/a` and carries raw token counts instead of invented percentages. The
- * full envelope breakdown (window, budget, headroom, tokens for each figure) stays
- * with `/fastcompact`. When `debug` also attached a dump path, one more line names
- * where this compiled window's on-disk copy lives, so a later agent can pull
- * details that got coarsened into a reference.
+ * one and what it freed. Everything reads as a percentage of the RAW window, the
+ * one basis the row's two context knobs speak: `thresholdRatio` arms the gate at
+ * ceil(W × ratio) against the meter's message-only surface, and `contextMaxRatio`
+ * caps what may survive after. A share past that ceiling clamps to it (the gate line
+ * prints both shares, and `clampedToCeiling` marks which one moved), so pressure still
+ * fires at the last reachable step before the request overflows. Every
+ * figure comes from the engine's own measurement (`contextStats`, against the token
+ * meter and the row's window share), never a guess; a route whose capacity could
+ * not be read says `n/a` and carries raw token counts instead of invented
+ * percentages. `/fastcompact` spells out the same numbers for the live session.
+ * When `debug` also attached a dump path, one more line names where this compiled
+ * window's on-disk copy lives, so a later agent can pull details that got
+ * coarsened into a reference.
  * @param {object|null} stats - numbers from `engine.contextStats` (null = no block); may carry `debugDumpPath`.
  * @returns {string} - the block ('' when there is nothing to report).
  */
@@ -746,10 +751,11 @@ export function contextStatsBlock(stats) {
   if (!known) {
     usageLine = `- usage before compact: n/a of the window (${groupInt(stats.beforeTokens)} tokens, capacity unknown for ${stats.route ?? '(unknown route)'}), after compact: n/a (~${groupInt(stats.afterTokens)} tokens, freed ${groupInt(stats.freedTokens)})`;
   } else {
-    const schema = typeof stats.toolSchemaTokens === 'number' && stats.toolSchemaTokens > 0
-      ? `; ${groupInt(stats.toolSchemaTokens)} tokens of tool schemas (${shareOf(stats.toolSchemaTokens, stats.contextWindow)} of the window) are priced by the meter but never counted by that gate`
+    const clampNote = stats.clampedToCeiling === true
+      ? ` (the row wanted ${shareOf(stats.requestedGateTokens, stats.contextWindow)} of the window; its messages top out at ${shareOf(stats.gateTokens, stats.contextWindow)}, so it fires there)`
       : '';
-    usageLine = `- usage before compact: ${shareOf(stats.beforeTokens, stats.contextWindow)} of the window, after compact: ${shareOf(stats.afterTokens, stats.contextWindow)} (gate ${shareOf(stats.gateTokens, stats.contextWindow)}, freed ${groupInt(stats.freedTokens)} tokens${schema})`;
+    const borrowedNote = stats.beyondBudget === true ? ' — a share past what the messages can hold, so pressure here runs on borrowed time' : '';
+    usageLine = `- usage before compact: ${shareOf(stats.beforeTokens, stats.contextWindow)} of the window, after compact: ${shareOf(stats.afterTokens, stats.contextWindow)} (gate ${shareOf(stats.gateTokens, stats.contextWindow)} of the window${clampNote}${borrowedNote}, freed ${groupInt(stats.freedTokens)} tokens)`;
   }
   const lines = [STATS_HEADING, usageLine];
   // Row knob `debug` also names where this compiled window's on-disk copy lives.
@@ -844,9 +850,11 @@ export function buildCheckpoint(session, start, end, options = {}) {
   // route (W=65,535 with O=32,000 reserved), i.e. 49% of the 33,535 tokens that actually
   // fit — enough to push the session past its own gate in a single step. Against the
   // budget the same 0.25 row claims 8,383 tokens = 25% of what the route can carry,
-  // which is what the number has always meant to the user (and matches how this plugin
-  // already re-expresses `thresholdRatio`: see applyDerivedHeadroom / deriveRoutePressure
-  // in lib/engine.mjs). When the route names no budget, the raw window stands in for it
+  // which is what the number has always meant to the user. Unlike the pressure gate —
+  // one share of the window, compared against the meter's surface reading — this share
+  // bounds text this plugin writes INTO that budget, so it stays on the budget basis:
+  // claiming a share of the raw window would let one compaction spend nearly half the
+  // room the route has. When the route names no budget, the raw window stands in for it
   // — nothing is invented — and the legacy fixed block stays the section budget.
   // Four bytes per token is the estimate used HERE only (the mounted meter prices the
   // finished body exactly, and those are the numbers the stats block reports). The ONLY

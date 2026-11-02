@@ -12,6 +12,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { buildEvents } from './helpers.mjs';
 import {
   CONTEXT_KINDS,
@@ -611,12 +612,19 @@ test('compiler: the stats block is one line with the window percentages', () => 
   assert.ok(block.includes('freed 19,250 tokens'), 'the reduction in tokens');
 });
 
-test('compiler: the one-line block still names the tool-schema overhead', () => {
+test('compiler: the one-line block states only the window shares', () => {
   const block = contextStatsBlock(WINDOW_STATS);
-  assert.ok(block.includes('7,682 tokens of tool schemas (11.7% of the window) are priced by the meter but never counted by that gate'), 'the envelope part the messages gate never counts');
-  const withoutOverhead = { ...WINDOW_STATS };
-  delete withoutOverhead.toolSchemaTokens;
-  assert.ok(!contextStatsBlock(withoutOverhead).includes('tool schemas'), 'the clause only appears when the meter actually separated it');
+  assert.ok(block.includes('gate 46.1% of the window'), 'the gate share, in the same basis as the usage shares');
+  assert.ok(!block.includes('tool schemas'), 'no envelope breakdown: the gate never counts those tokens, so they stay out of the line');
+  assert.ok(!block.includes('of the budget') && !block.includes('headroom'), 'no budget or headroom prose');
+});
+
+test('compiler: a gate clamped to what the messages can reach says so', () => {
+  const clamped = { ...WINDOW_STATS, requestedGateTokens: 58_982, clampedToCeiling: true, beyondBudget: true };
+  const block = contextStatsBlock(clamped);
+  assert.ok(block.includes('(the row wanted 90.0% of the window; its messages top out at 46.1%, so it fires there)'), 'the clamp is stated with both shares');
+  assert.ok(block.includes('a share past what the messages can hold, so pressure here runs on borrowed time'), 'and that the share sits beyond the message budget');
+  assert.ok(!block.includes('message budget'), 'the note is about the shares, not about token arithmetic');
 });
 
 test('compiler: an unknown route capacity says n/a and keeps the counts', () => {
@@ -630,7 +638,7 @@ test('compiler: an unknown route capacity says n/a and keeps the counts', () => 
 });
 
 test('compiler: the stats block names the debug dump file when the row knob attached one', () => {
-  const dump = 'C:\\Users\\vic\\.dsh\\debug\\session-s1-1761954000000-seq10-2046.txt';
+  const dump = path.join('debug', 'session-s1-1761954000000-seq10-2046.txt');
   const withDump = contextStatsBlock({ ...WINDOW_STATS, debugDumpPath: dump });
   assert.ok(withDump.split('\n').length === 3, 'usage line plus the dump line');
   assert.ok(withDump.includes(`- debug dump: ${dump}`), 'the on-disk copy is named where it lives');

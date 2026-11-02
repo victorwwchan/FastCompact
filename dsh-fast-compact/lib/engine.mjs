@@ -14,18 +14,19 @@
  * Row config is this plugin's own surface: the base's zod schema is replaced by
  * `null` so cordis does not reject our keys; the row is split in the
  * constructor, host keys are forwarded to the base (which validates them) and
- * ours are validated here. TWO host keys are derived instead of forwarded —
- * `headroomTokens` AND `thresholdRatio`, merged from the per-route table `index.mjs`
- * read off the adapter metadata: the row states its ratio as a share of each
- * route's usable message budget, and the base multiplies its ratio by the raw
- * window, so a row can no longer carry a headroom or a ratio that only fits one
- * window size.
+ * ours are validated here. ONE host key is derived instead of forwarded:
+ * `headroomTokens`, merged from the per-route table `index.mjs` read off the
+ * adapter metadata: the base's own formula wants a margin scaled to each window,
+ * and its default assumes a huge one. `thresholdRatio` rides untouched — the row
+ * states it as a share of the RAW window, which is the basis the base multiplies
+ * and the basis every report prints, so one number both sets and explains the
+ * firing point.
  *
  * @module dsh-fast-compact/engine
  */
 
 import path from 'node:path';
-import { resolveFastCompactConfig, splitRowConfig, applyDerivedHeadroom, deriveRoutePressure, HEADROOM_RATIO } from './config.mjs';
+import { resolveFastCompactConfig, splitRowConfig, applyDerivedHeadroom, deriveHeadroomTokens, HEADROOM_RATIO } from './config.mjs';
 import { buildCheckpoint } from './compiler.mjs';
 import { releasePins } from './pins.mjs';
 
@@ -65,7 +66,7 @@ export function createEngineClass(runtime) {
       // mounting, or the profile added the route later). The gate must still be
       // enforced, so the first compaction decision for an unknown route reads its
       // capacity through the same `llm` service and derives the pair here — the
-      // row's ratio semantics (a share of the message budget) then govern the
+      // row's ratio semantics (a share of that route's WINDOW) then govern the
       // guard AND the debug stats, instead of silently falling back to the base.
       this.routeGates = new Map();
       // The row's own ratios, kept so a late-read route can be sized with the
@@ -86,10 +87,13 @@ export function createEngineClass(runtime) {
      * demand. `describeRoute` reads the table `index.mjs` built at mount; when it
      * names nothing for this route, the capacity is read through `ctx.llm` right
      * now and cached, so a route that was invisible at mount still gets its real
-     * budget-relative gate instead of the base's untranslated default. Null only
-     * when neither path can name a capacity (then nothing is invented).
+     * window-relative gate instead of riding the base's envelope threshold. W itself
+     * comes straight from the session (`requestContext()`), which is what the token
+     * meter prices against — no capacity lookup when the route already rode a
+     * request. Null only when no window can be named at all (then nothing is
+     * invented).
      * @param {object} session - the session whose request header names the route.
-     * @returns {object|null} - `{ route, contextWindow, outputReserved, messageBudget, headroomTokens, thresholdRatio, gateTokens }`.
+     * @returns {object|null} - `{ route, contextWindow, outputReserved, messageBudget, headroomTokens, thresholdRatio, gateTokens, requestedGateTokens, ceilingTokens, clampedToCeiling, beyondBudget }`, with `headroomTokens` null when no margin could be derived (the clamp then uses the bare message budget).
      */
     async learnRoute(session) {
       const known = this.routeFor(session);
@@ -97,42 +101,52 @@ export function createEngineClass(runtime) {
       const config = session.requestHeader()?.config;
       if (config === undefined || typeof config.provider !== 'string' || typeof config.model !== 'string') return null;
       const key = `${config.provider}/${config.model}`;
-      const llm = this.ctx?.llm;
-      if (llm === undefined || typeof llm.resolveModelInfo !== 'function') return null;
       const ratio = this.rowRatios.get(key) ?? this.rowRatio;
       if (ratio === null) return null; // the row states no ratio: leave the base's decision alone
-      let info;
-      try {
-        info = await llm.resolveModelInfo(config.provider, config.model);
-      } catch (error) {
-        this.ctx?.logger?.warn(`${LOG_PREFIX} route ${key} has no readable capacity at compaction time (${String(error.message)}); the base's own gate governs it`);
-        return null;
+      // W straight from the session when its route has already ridden a request:
+      // `requestContext()` is what dsh-agent-loop appends as `request/context`
+      // (dsh-agent-loop/lib/index.js:1262) and the denominator of the meter's own
+      // `contextPressure` projection — the window that routed request ACTUALLY got,
+      // with no capacity lookup and no re-derivation. The adapter metadata only fills
+      // in for a session that has not sent one yet.
+      const live = session.requestContext();
+      let contextWindow = typeof live?.contextWindow === 'number' ? live.contextWindow : undefined;
+      let defaultMaxTokens = 0;
+      if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
+        const llm = this.ctx?.llm;
+        if (llm === undefined || typeof llm.resolveModelInfo !== 'function') return null;
+        let info;
+        try {
+          info = await llm.resolveModelInfo(config.provider, config.model);
+        } catch (error) {
+          this.ctx?.logger?.warn(`${LOG_PREFIX} route ${key} has no readable capacity at compaction time (${String(error.message)}); the base's own gate governs it`);
+          return null;
+        }
+        contextWindow = typeof info === 'object' ? info.context?.contextWindow : undefined;
+        defaultMaxTokens = typeof info?.defaultMaxTokens === 'number' ? info.defaultMaxTokens : 0;
       }
-      const contextWindow = typeof info === 'object' ? info.context?.contextWindow : undefined;
       if (!Number.isInteger(contextWindow) || contextWindow <= 0) return null;
-      const defaultMaxTokens = typeof info?.defaultMaxTokens === 'number' ? info.defaultMaxTokens : 0;
       const outputReserved = typeof config.maxTokens === 'number' ? config.maxTokens : defaultMaxTokens;
-      let derived;
-      try {
-        derived = deriveRoutePressure(contextWindow, ratio, defaultMaxTokens, this.headroomRatio);
-      } catch (error) {
-        this.ctx?.logger?.warn(`${LOG_PREFIX} derived pressure for ${key} rejected (${String(error.message)}); the base's own gate governs it`);
-        return null;
-      }
       const messageBudget = contextWindow - outputReserved;
-      const headroomTokens = derived.headroomTokens;
-      const translated = derived.thresholdRatio ?? ratio;
-      const gateTokens = Math.floor(Math.min(contextWindow * translated, messageBudget - headroomTokens));
-      if (!(messageBudget > 0) || !(headroomTokens >= 1) || !(gateTokens > 0)) return null;
-      const gate = {
-        route: key,
-        contextWindow,
-        outputReserved,
-        messageBudget,
-        headroomTokens,
-        thresholdRatio: translated,
-        gateTokens,
-      };
+      // The gate is one comparison: the row's share of W, against what the meter
+      // says the MESSAGES cost. `deriveHeadroomTokens` derives only the base-side
+      // margin this plugin still hands the engine; the requested share, the
+      // ceiling, the clamp and the object itself are ALL computed by
+      // `buildRouteGate` — the same function `describeRoute` uses for a
+      // table-named route, so the table path and the learned path always carry
+      // one gate number for one route. A share the messages can never reach
+      // clamps to that ceiling — pressure then fires at the last reachable step
+      // instead of never firing, and the clamp is reported.
+      let headroomTokens = null;
+      try {
+        headroomTokens = deriveHeadroomTokens(contextWindow, ratio, defaultMaxTokens, this.headroomRatio);
+      } catch (error) {
+        // The margin feeds only the base's own formula; a rejected derivation
+        // leaves the base default in place, and this plugin's gate never needed it.
+        this.ctx?.logger?.warn(`${LOG_PREFIX} derived margin for ${key} rejected (${String(error.message)}); the base keeps its own headroom while the row's share still gates`);
+      }
+      if (!(Math.ceil(contextWindow * ratio) > 0) || !(messageBudget > 0)) return null;
+      const gate = buildRouteGate(key, contextWindow, outputReserved, headroomTokens, ratio);
       this.routeGates.set(key, gate);
       while (this.routeGates.size > PER_SESSION_CAP) this.routeGates.delete(this.routeGates.keys().next().value);
       return gate;
@@ -148,31 +162,37 @@ export function createEngineClass(runtime) {
     }
 
     /**
-     * Automatic compaction, deferred until the row's OWN basis says so.
+     * Automatic compaction, deferred until the row's window percentage says so.
      *
      * The base decides on `tokenMeter.measure(session).totalTokens`, which prices
      * the whole request envelope: the conversation surface PLUS the route's tool
      * schemas (`estimateToolsTokens(header)` in dsh-token-meter/lib/index.js:83,
      * folded into the baseline at line 753). Tool schemas are a per-request
-     * constant no conversation can grow, so on a small window they occupy a big
-     * share of the usable message budget before one message token is counted — a
-     * row saying `thresholdRatio: 0.8` on a 65,535/32,000 route (budget 33,535,
-     * gate 26,828) trips while the messages still hold ~19,000 tokens = 29% of
-     * the window, and it re-trips on nearly every response because the retained
-     * tail only has to climb back over a gate already half-filled by schemas.
-     * This plugin's ratio is a share of the MESSAGES (see `deriveRoutePressure`),
-     * so the gate it derived is enforced HERE against `surfaceTokens` — the
-     * surface-only total, which excludes envelope overhead by construction.
-     * Everything else stays with the base: selection, retention, pruning, the
-     * retry loop and the durable compaction bracket.
+     * constant no conversation can grow, so an envelope-based reading gets a head
+     * start that nothing in the session controls — on strata-llm/64KB (W=65,535)
+     * with schemas near 19,000 that is ~29% of the window already spent before the
+     * first message token counts, and the base re-trips on nearly every later
+     * response because the retained tail only has to climb back over a threshold
+     * the schemas nearly filled.
+     * The row's ratio is a share of the route's WINDOW, so the gate it names is a
+     * percentage of the messages; enforce it HERE against `surfaceTokens` — the
+     * meter's surface-only reading, which excludes envelope overhead by
+     * construction — and against `ceil(W * ratio)` read off the window the session
+     * actually rode. Nothing else enters the comparison: no output reservation, no
+     * headroom, no budget-relative translation (see deriveRoutePressure). The same
+     * number therefore means the same thing in the mount log, in `/fastcompact`
+     * and in the checkpoint's stats block. Everything else stays with the base:
+     * selection, retention, pruning, the retry loop and the durable compaction
+     * bracket.
      *
      * `context-overflow` is never guarded: recovery reacts to a provider-confirmed
      * rejection and must act even when the messages sit under the gate. A route
      * whose capacity neither the mount table nor `learnRoute` can name yields no
      * gate, so nothing is invented and the base's own decision rides untouched —
      * and that route is read through `ctx.llm` at this very moment, so a profile
-     * whose capacities were not ready at mount still gets its real gate on the
-     * first pressure decision rather than an untranslated default.
+     * whose capacities were not ready at mount still gets its real window-relative
+     * gate on the first pressure decision instead of riding the base's envelope
+     * threshold alone.
      * @param {object} agent - agent owning the session the base would measure.
      * @param {'pressure'|'context-overflow'} trigger - the base's two triggers.
      * @param {AbortSignal} signal - cancellation forwarded to summarization.
@@ -186,6 +206,8 @@ export function createEngineClass(runtime) {
           const measurement = meter.measure(agent.session);
           if (measurement.surfaceTokens < route.gateTokens) return null;
         }
+		
+		
       }
       return await super.compactIfNeeded(agent, trigger, signal);
     }
@@ -458,6 +480,38 @@ export function createEngineClass(runtime) {
           lastDump: typeof stats?.debugDumpPath === 'string' ? stats.debugDumpPath : null,
         };
       }
+
+      /**
+       * The row's own configuration knobs for `/fastcompact`, as they resolve for
+       * ONE session's route: the base-resolved row (this.config) already carries
+       * `thresholdRatio` and the retention choice with the base's defaults applied,
+       * so per-route `modelPolicies` overrides are the only thing this method adds
+       * — plus this plugin's own `contextMaxRatio`, which never crosses into the
+       * base. Raw numbers; the command formats them.
+       * @param {object} session - the session whose route governs the numbers.
+       * @returns {{ thresholdRatio: number|null, retainRatio: number|null, retainTokens: number|null, contextMaxRatio: number }}
+       */
+      configStatus(session) {
+        const header = session?.requestHeader()?.config;
+        const row = this.config ?? {};
+        const override = Array.isArray(row.modelPolicies) && header !== undefined
+          ? row.modelPolicies.find((policy) => policy.provider === header.provider && policy.model === header.model) ?? null
+          : null;
+        const gate = this.routeFor(session);
+        const thresholdRatio = gate?.thresholdRatio ?? override?.thresholdRatio ?? row.thresholdRatio ?? BASE_DEFAULT_THRESHOLD_RATIO;
+        let retainRatio = null;
+        let retainTokens = null;
+        if (override !== null && override.retainTokens !== undefined) {
+          retainTokens = override.retainTokens;
+        } else if (override !== null && override.retainRatio !== undefined) {
+          retainRatio = override.retainRatio;
+        } else if (row.retainTokens !== undefined) {
+          retainTokens = row.retainTokens;
+        } else {
+          retainRatio = row.retainRatio ?? null;
+        }
+        return { thresholdRatio, retainRatio, retainTokens, contextMaxRatio: this.options.contextMaxRatio };
+      }
     }
 
   return FastCompactEngine;
@@ -505,17 +559,55 @@ export function locateRegion(session, input) {
 const BASE_DEFAULT_THRESHOLD_RATIO = 0.8;
 
 /**
+ * The ONE computation of a route's pressure-gate object. Every caller resolves
+ * its own inputs — `describeRoute` from the mount table, `learnRoute` from the
+ * session plus a live capacity read — and passes them here, so the table path
+ * and the learned path always return the same shape with the same numbers for
+ * the same route: the row's share of W requested (`ceil(W * ratio)`), the
+ * ceiling the messages can actually reach (the bare message budget when no
+ * margin could be derived), and the gate clamped to that ceiling so a
+ * past-budget share still fires at its last reachable step instead of never
+ * firing. Nothing else in this file builds the object.
+ * @param {string} route - `provider/model`.
+ * @param {number} contextWindow - W, the window the session rode.
+ * @param {number} outputReserved - O, this request's reply reservation.
+ * @param {number|null} headroomTokens - the derived margin, null when none could be.
+ * @param {number} ratio - the row's thresholdRatio (a share of W).
+ * @returns {{ route, contextWindow, outputReserved, messageBudget, headroomTokens, thresholdRatio, gateTokens, requestedGateTokens, ceilingTokens, clampedToCeiling, beyondBudget }}
+ */
+function buildRouteGate(route, contextWindow, outputReserved, headroomTokens, ratio) {
+  const requestedGateTokens = Math.ceil(contextWindow * ratio);
+  const messageBudget = contextWindow - outputReserved;
+  const ceilingTokens = headroomTokens === null ? messageBudget : messageBudget - headroomTokens;
+  const gateTokens = Math.min(requestedGateTokens, Math.max(1, ceilingTokens));
+  return {
+    route,
+    contextWindow,
+    outputReserved,
+    messageBudget,
+    headroomTokens,
+    thresholdRatio: ratio,
+    gateTokens,
+    requestedGateTokens,
+    ceilingTokens,
+    clampedToCeiling: gateTokens < requestedGateTokens,
+    // Facts about the row's share against this route's message budget: past it,
+    // pressure runs on borrowed time (the clamp above is what keeps it firing at all).
+    beyondBudget: requestedGateTokens > messageBudget,
+  };
+}
+
+/**
  * Resolve the capacity facts of the route one session durably routed, straight
- * from the derived pressure table: W and O as the adapter declared them, the
- * headroom and ratio this plugin handed the base for that route, and the gate the
- * base's own formula (`floor(min(W * ratio, (W - O) - headroom))`) therefore
- * produces. Reporting is deliberately computed the way the base computes it — so
- * the percentages a checkpoint prints are the ones that tripped it. A route the
- * table never named (or no table at all) yields null: token counts without
- * invented percentages.
+ * from the derived pressure table: W and O as the adapter declared them, plus
+ * the headroom and ratio this plugin handed the base for that route — and then
+ * `buildRouteGate` derives the gate, exactly as `learnRoute` does for a route
+ * the table never named, so both paths carry one number. A route the table
+ * never named (or no table at all) yields null: token counts without invented
+ * percentages.
  * @param {object|null} table - `derivedHeadroom` as the row config carried it.
  * @param {object} session - the session whose request header names the route.
- * @returns {{ route, contextWindow, outputReserved, messageBudget, headroomTokens, thresholdRatio, gateTokens } | null}
+ * @returns {{ route, contextWindow, outputReserved, messageBudget, headroomTokens, thresholdRatio, gateTokens, requestedGateTokens, ceilingTokens, clampedToCeiling, beyondBudget } | null}
  */
 function describeRoute(table, session) {
   const config = session.requestHeader()?.config;
@@ -528,15 +620,6 @@ function describeRoute(table, session) {
   const messageBudget = contextWindow - outputReserved;
   if (!(typeof contextWindow === 'number' && contextWindow > 0) || !(messageBudget > 0) || !(headroomTokens >= 1)) return null;
   const ratio = typeof entry.thresholdRatio === 'number' ? entry.thresholdRatio : BASE_DEFAULT_THRESHOLD_RATIO;
-  const gateTokens = Math.floor(Math.min(contextWindow * ratio, messageBudget - headroomTokens));
-  if (!(gateTokens > 0)) return null;
-  return {
-    route: `${config.provider}/${config.model}`,
-    contextWindow,
-    outputReserved,
-    messageBudget,
-    headroomTokens,
-    thresholdRatio: ratio,
-    gateTokens,
-  };
+  if (!(Math.ceil(contextWindow * ratio) > 0)) return null;
+  return buildRouteGate(`${config.provider}/${config.model}`, contextWindow, outputReserved, headroomTokens, ratio);
 }
