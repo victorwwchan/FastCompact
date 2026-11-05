@@ -1,7 +1,13 @@
 {
   "name": "dsh-fast-compact-preset",
   "version": "0.1.0",
-  "private": true,
+  "description": "DSH agent preset bundle: the shipped 'standard' preset with dsh-fast-compact (deterministic, zero-LLM compaction) as the engine.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/victorwwchan/FastCompact.git",
+    "directory": "dsh-fast-compact-preset"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
