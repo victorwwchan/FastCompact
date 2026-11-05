@@ -1,0 +1,29 @@
+{
+  "name": "dsh-fast-compact",
+  "version": "0.1.0",
+  "description": "Deterministic zero-LLM compaction engine for DeepSeek Harness: dropped tool traffic becomes session-log seq reference lines.",
+  "type": "module",
+  "files": [
+    "index.mjs",
+    "lib/",
+    "cordis.patch.yml",
+    "docs/"
+  ],
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "selfcheck": "node scripts/selfcheck.mjs"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "engines": {
+      "dsh": ">=0.1.5-rc.2 <0.3.0"
+    }
+  }
+}

@@ -1,0 +1,80 @@
+# --- Logs & runtime state ---
+logs/
+*.log
+*.log.*
+*-debug/
+*.jsonl
+compaction-log.json
+/*.txt
+/*.mjs
+/*.bak
+
+.usage.json
+.usage.json.lock
+*.json
+
+!package.json
+
+# --- Temp / scratch ---
+.tmp-deepseek-bot/
+*.tmp
+*.temp
+
+# --- Session transcripts (local runtime state, not for the repo) ---
+sessions/
+
+# --- Generated test output (the e2e suite rewrites these every run — churn, not source) ---
+test/out/
+**/test/out/
+
+# --- Skill hub cache & curator backups (large, regenerable) ---
+skills/.hub/index-cache/
+skills/.curator_backups/
+skills/.curator_state
+skills/.bundled_manifest
+
+#exclude nested git folders
+/fast-compact/.git/
+
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Node / JS ---
+node_modules/
+dist/
+build/
+.next/
+.cache/
+
+# --- Environment & secrets ---
+.env
+.env.*
+!.env-example
+
+# --- OS junk ---
+Thumbs.db
+desktop.ini
+.DS_Store
+
+.pnpm-store/
+integrations/
+storages/
+
+
+telegram/prepaim-repro4/raw/
+telegram/prepaim/probe/_flashcards.html
+telegram/prepaim/probe/_flashcards_all.html
+telegram/prepaim/probe/_flashcards_browse.html
+telegram/prepaim/probe/_flashcards_study.html
+telegram/prepaim/probe/_flashcards_tags.html
+telegram/prepaim/probe/_vocabulary.html
+telegram/prepaim/raw/
+telegram/ssat-vocab/probe/
+telegram/ssat-vocab/raw/
+telegram/ssat-vocab/raw2/
