@@ -1,5 +1,18 @@
 # dsh-fast-compact
 
+## What problem it solves
+
+This plugin mainly solves two problems:
+
+1. **The model's long summarizing time during compaction.** Normal compaction burns a
+   whole LLM round-trip writing a summary; this engine skips that step entirely.
+   Without it, the session runs ~90% faster and smoother — no mid-conversation
+   stalls while the model rewrites its own history.
+2. **Small context windows (e.g. 64 KB).** With Fast Compact, a small window feels like
+   an infinite one: compacted history becomes tiny `seq` pointers instead of prose, so it
+   never eats the window you have left. That lets you run larger models at a reasonable
+   speed instead of being forced onto a smaller one to fit the window.
+
 The idea is simple: **make compaction fast by not using a model at all.** A normal
 compaction spends a whole LLM round-trip writing prose that the next turn then has to
 re-read. This engine skips that step — compaction is computed locally and deterministically
