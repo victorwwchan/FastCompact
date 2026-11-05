@@ -1,0 +1,36 @@
+Publish dsh-fast-compact@0.1.0  (browser auth + 24h unpublish cooldown)
+========================================================================
+
+Situation (verified against the npm registry, 2026-11-03):
+  - You unpublished `dsh-fast-compact` today at 8:00:10 PM PDT
+    (2026-11-04T04:00:10Z). Only one version ever existed under the name:
+    `0.0.0-stage`. That number is burned forever.
+  - npm policy: after unpublishing ALL versions, the name cannot be
+    republished for 24 HOURS (applies to you as owner too).
+  - Our staged tarball is version `0.1.0`, which was NEVER published ->
+    it is clean. NO RE-PACKING NEEDED; the existing tarball is final.
+
+  ==> Earliest retry: TOMORROW, 2026-11-04, after ~8:05 PM PDT
+      (24h after 2026-11-04T04:00:10Z).
+  If earlier, expect exactly this error:
+      npm ERR! 403 ... dsh-fast-compact cannot be republished until 24 hours have passed.
+
+How to publish (open a NORMAL PowerShell window as your usual user):
+
+    cd C:\Users\vic\.dsh\fast-compact\dsh-fast-compact
+    & "E:\nodejs\npm.cmd" publish .\dsh-fast-compact-0.1.0.tgz
+
+What happens next (automatic, no code to copy):
+  1. npm -> registry asks for a one-time password, returns a private auth URL.
+  2. npm opens that URL in your browser automatically.
+  3. You log in / approve in the browser.
+  4. npm fetches the one-time token from the "done" URL and re-sends the
+     publish. Success prints:  + dsh-fast-compact@0.1.0
+
+Verify from anywhere afterwards:
+    npm view dsh-fast-compact version        (expected: 0.1.0)
+    npm install -g dsh-fast-compact          (or however DSH installs it)
+
+If the browser doesn't auto-open: the auth URL is printed in the terminal;
+open it manually, and if prompted for "Enter OTP:" use the one-time code
+shown on the second ("done") URL npm prints.
