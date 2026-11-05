@@ -15,42 +15,46 @@ dropped tool call/result becomes a one-line `seq` pointer the resumed model can 
 
 ## Quick start
 
-The engine is on npm as **`dsh-fast-compact`**; the installable unit is still the preset
-bundle **`dsh-fast-compact-preset`** (it carries the live `fast-compact` compaction row),
-which is not published yet — take it from this repository. A DSH profile is an npm project
-(`~/.dsh/profiles/<name>`, `%USERPROFILE%\.dsh\profiles\<name>` on Windows), so installing
-means: add the two packages as dependencies, select the preset bundle, pick the preset,
-restart. Requires Node `^22.19.0 || >=24.0.0` and dsh `>=0.1.5-rc.2 <0.3.0`.
+Fast Compact ships as **two npm packages**: `dsh-fast-compact` (the engine) and
+**`dsh-fast-compact-preset`** (the "standard" preset bundle; its compaction row points at
+the engine by name, so both must be direct dependencies of the profile). A DSH profile is
+an npm project (`%USERPROFILE%\.dsh\profiles\<name>` on Windows,
+`~/.dsh/profiles/<name>` elsewhere); installing means adding both packages to the profile's
+dependencies and to its `dsh.profile.bundles` list, then picking the preset. Requires Node
+`^22.19.0 || >=24.0.0` and dsh `>=0.1.5-rc.2 <0.3.0`.
+
+### 1. DSH UI (Web)
+
+Open **Plugins** in the Web sidebar and use **Add plugin** to install
+`dsh-fast-compact` and `dsh-fast-compact-preset` one after the other — installing a bundle
+registers it in the profile's `dsh.profile.bundles` automatically. Then pick
+**Fast Compact (standard)** in the preset picker and start a **new** session (running
+sessions keep their own projection).
+
+### 2. DSH CLI (`dsh plugin add`)
 
 ```sh
-# 1. install the engine from npm into your profile
-cd ~/.dsh/profiles/web                    # any profile you maintain
-npm install dsh-fast-compact@^0.1.0
-
-# 2. add the preset bundle from a checkout of this repository (not on npm yet)
-git clone https://github.com/victorwwchan/FastCompact /tmp/fast-compact-src
-npm install /tmp/fast-compact-src/dsh-fast-compact-preset
+dsh plugin --profile web add dsh-fast-compact dsh-fast-compact-preset   # pnpm add, both packages
 ```
 
-3. In the profile's `package.json`, select the bundles:
+`dsh plugin add` forwards to pnpm verbatim and does **not** touch `bundles` — afterwards
+add both names to the profile's `package.json`:
 
-   ```json
-   { "dsh": { "profile": { "bundles": ["dsh-fast-compact-preset", "dsh-fast-compact"] } } }
-   ```
+```json
+{ "dsh": { "profile": { "bundles": ["dsh-fast-compact-preset", "dsh-fast-compact"] } } }
+```
 
-4. In the profile's own `cordis.patch.yml`, pick the preset (or choose
-   **Fast Compact (standard)** in the client UI's preset picker instead):
+Then select the preset: pick **Fast Compact (standard)** in the client UI, or set it in
+the profile's own `cordis.patch.yml`:
 
-   ```yaml
-   - id: agent-preset-registry
-     name: "@deepseek-ai/dsh-agent-preset-registry"
-     config:
-       selectedDefault: fast-compact
-   ```
+```yaml
+- id: agent-preset-registry
+  name: "@deepseek-ai/dsh-agent-preset-registry"
+  config:
+    selectedDefault: fast-compact
+```
 
-5. Restart dsh and start a **new** session — running sessions keep their own preset
-   projection. Until `dsh-fast-compact-preset` reaches npm, step 2 stays a path install
-   (once published it becomes `npm install dsh-fast-compact-preset`).
+Restart dsh and start a **new** session — running sessions keep their own preset projection.
 
 ## Engine surface
 
@@ -287,9 +291,11 @@ above); over any budget → oldest lines fold.
 The installable unit is the **preset bundle** `dsh-fast-compact-preset`: a copy
 of the shipped "standard" preset whose `compaction` isolate group carries this
 row (its `cordis.patch.yml` is already on the new keys — host-pressure keys plus
-`thoughtChars`, `refLineFormat`, `instructions`). Install the bundle, select
-preset `preset-fast-compact`, start a new session. This package's own `cordis.patch.yml` is a comment header plus an
-empty row list (`[]`) — installing it alone can never change the host boot.
+`thoughtChars`, `refLineFormat`, `instructions`). Install both packages into your
+profile (**Quick start** above covers the UI and CLI paths), select preset
+`fast-compact` (**Fast Compact (standard)**), start a new session. This package's own
+`cordis.patch.yml` is a comment header plus an empty row list (`[]`) — installing it
+alone can never change the host boot.
 
 The row REPLACES any other compaction engine in that isolate group (one
 `ctx.compaction` per context). It re-registers its own recall tools and the

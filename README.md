@@ -13,6 +13,45 @@ dropped tool call/result becomes a one-line `seq` pointer the resumed model can 
 - [read the compiler to find the state block…] (thought seq 193) → seq 196, result seq 197, 15.7 KB
 ```
 
+## Quick start
+
+The engine is on npm as **`dsh-fast-compact`**; the installable unit is still the preset
+bundle **`dsh-fast-compact-preset`** (it carries the live `fast-compact` compaction row),
+which is not published yet — take it from this repository. A DSH profile is an npm project
+(`~/.dsh/profiles/<name>`, `%USERPROFILE%\.dsh\profiles\<name>` on Windows), so installing
+means: add the two packages as dependencies, select the preset bundle, pick the preset,
+restart. Requires Node `^22.19.0 || >=24.0.0` and dsh `>=0.1.5-rc.2 <0.3.0`.
+
+```sh
+# 1. install the engine from npm into your profile
+cd ~/.dsh/profiles/web                    # any profile you maintain
+npm install dsh-fast-compact@^0.1.0
+
+# 2. add the preset bundle from a checkout of this repository (not on npm yet)
+git clone https://github.com/victorwwchan/FastCompact /tmp/fast-compact-src
+npm install /tmp/fast-compact-src/dsh-fast-compact-preset
+```
+
+3. In the profile's `package.json`, select the bundles:
+
+   ```json
+   { "dsh": { "profile": { "bundles": ["dsh-fast-compact-preset", "dsh-fast-compact"] } } }
+   ```
+
+4. In the profile's own `cordis.patch.yml`, pick the preset (or choose
+   **Fast Compact (standard)** in the client UI's preset picker instead):
+
+   ```yaml
+   - id: agent-preset-registry
+     name: "@deepseek-ai/dsh-agent-preset-registry"
+     config:
+       selectedDefault: fast-compact
+   ```
+
+5. Restart dsh and start a **new** session — running sessions keep their own preset
+   projection. Until `dsh-fast-compact-preset` reaches npm, step 2 stays a path install
+   (once published it becomes `npm install dsh-fast-compact-preset`).
+
 ## Engine surface
 
 `FastCompactEngine` (`lib/engine.mjs`, built by `createEngineClass(runtime)`)
