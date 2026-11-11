@@ -25,13 +25,13 @@ import { pathToFileURL } from 'node:url';
 import { readdir, readFile } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import { findDsh } from '../scripts/find-dsh.mjs';
-import { loadRuntime } from '../lib/runtime.mjs';
-import { createEngineClass, locateRegion, ENGINE_PROVIDER, ENGINE_MODEL } from '../lib/engine.mjs';
-import { buildCheckpoint, STATS_HEADING, groupInt } from '../lib/compiler.mjs';
-import { deriveRoutePressure } from '../lib/config.mjs';
-import { pin, pinsFor } from '../lib/pins.mjs';
-import { recall } from '../lib/recall.mjs';
-import { buildEvents, toolResultsOf } from './helpers.mjs';
+import { Runtime } from '../lib/runtime.mjs';
+import { Engine, ENGINE_PROVIDER, ENGINE_MODEL } from '../lib/engine.mjs';
+import { Compiler, STATS_HEADING } from '../lib/compiler.mjs';
+import { Config } from '../lib/config.mjs';
+import { Pins } from '../lib/pins.mjs';
+import { Recall } from '../lib/recall.mjs';
+import { toolResultsOf, buildEvents } from './helpers.mjs';
 
 const entry = findDsh();
 const skip = entry === undefined ? 'dsh is not installed' : false;
@@ -39,14 +39,14 @@ const skip = entry === undefined ? 'dsh is not installed' : false;
 /** One runtime load shared by every test. */
 async function harness() {
   if (harness.loaded === undefined) {
-    const runtime = await loadRuntime(entry, { allowUntested: true });
+    const runtime = await Runtime.loadRuntime(entry, { allowUntested: true });
     const require = createRequire(entry);
     const { Session } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-session')).href);
     const { TokenMeter } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-token-meter')).href);
     harness.loaded = {
       Session,
       estimate: TokenMeter.prototype.estimateMessage, // standalone heuristic (never uses `this`)
-      Engine: createEngineClass(runtime),
+      Engine: Engine.createEngineClass(runtime),
     };
   }
   return harness.loaded;
@@ -175,11 +175,29 @@ test('engine: the base frames our compiled blocks as its replacement message', {
   // The blocks are ours, and they survive the framing untouched.
   assert.ok(text.includes('## State of work'), 'our state block survived into the window');
   assert.ok(text.includes('## Session-log references (dropped tool traffic)'), 'the reference section is in the window');
-  assert.ok(text.includes('## Session-log instruction'), 'and the resume instructions');
+  // The resume instruction no longer rides INSIDE the checkpoint: the mount injects it as
+  // its own live copy once per surface generation, so the default body carries no such pair.
+  assert.ok(!text.includes('<system prompt>'), 'the default body carries no instruction pair — the mount owns that copy');
   // Determinism: re-compiling the same span right now must reproduce exactly
   // what the base committed — no model, so nothing can have drifted.
-  const { text: again } = buildCheckpoint(session, result.shadowedRange.start, result.shadowedRange.end, {});
+  const { text: again } = Compiler.buildCheckpoint(session, result.shadowedRange.start, result.shadowedRange.end, {});
   assert.ok(text.includes(again), 'the committed body is byte-for-byte our compiler\'s own output');
+  revalidate(Session, session);
+});
+
+test('engine: a row-named instruction rides OUTSIDE the summary in its own pair', { skip }, async () => {
+  const sentinel = 'Sentinel rule: lead every reply with fresh state.';
+  const { Session, session, engine, agent } = await fcSetup({ instructions: sentinel });
+  const result = await engine.compactNow(agent, new AbortController().signal);
+  assert.ok(result !== null, 'compaction ran');
+  const [checkpoint] = checkpointMessages(session);
+  const text = textOf(checkpoint.data);
+  // The base closes its own summary frame before the instruction pair opens, then reopens
+  // a second summary frame for the carried body — every tag stays balanced.
+  assert.ok(text.includes('</compacted-summary>\n\n<system prompt>\n' + sentinel + '\n</system prompt>\n\n<compacted-summary>'),
+    'the instruction sits outside both summary frames, in its own pair, ahead of the body');
+  assert.equal((text.match(/<compacted-summary>/g) ?? []).length, 2, 'the summary frame is split, not doubled by accident');
+  assert.equal((text.match(/<\/compacted-summary>/g) ?? []).length, 2, 'and every open tag has its close tag');
   revalidate(Session, session);
 });
 
@@ -192,7 +210,7 @@ test('engine: every seq the references name is restorable through recall', { ski
   const referenced = [...text.matchAll(/result seq (\d+)/g)].map((match) => Number(match[1]));
   assert.ok(referenced.length > 0, 'the section names result seqs');
   for (const seq of referenced.slice(0, 5)) {
-    const restored = recall(session, { result: seq }, { maxChars: 4_000 });
+    const restored = Recall.recall(session, { result: seq }, { maxChars: 4_000 });
     assert.ok(restored.events >= 1, `seq ${seq} resolves to something`);
     assert.ok(restored.text.includes('RESULT-'), 'the ORIGINAL result text comes back, not a paraphrase');
     assert.ok(result.shadowedSeqs.includes(seq), `seq ${seq} was shadowed and is still in the log`);
@@ -257,7 +275,7 @@ test('engine: a recalled seq is pinned into the checkpoint, then released', { sk
     return event.type === 'user/message' && event.data?.source?.kind === 'user';
   });
   assert.ok(target !== undefined, 'the fixture has a human message to pin');
-  pin(session, [target]);
+  Pins.pin(session, [target]);
   const result = await engine.compactNow(agent, new AbortController().signal);
   assert.ok(result !== null, 'compaction ran');
   if (result.shadowedSeqs.includes(target)) {
@@ -267,12 +285,12 @@ test('engine: a recalled seq is pinned into the checkpoint, then released', { sk
     assert.ok(text.includes('## Pinned content (every user message kept'), 'under its own heading');
   }
   // The checkpoint now holds it, so a later compaction must not repeat it.
-  assert.deepEqual([...pinsFor(session)].filter((seq) => result.shadowedSeqs.includes(seq)), [], 'the pins the span honored were released');
+  assert.deepEqual([...Pins.pinsFor(session)].filter((seq) => result.shadowedSeqs.includes(seq)), [], 'the pins the span honored were released');
   revalidate(Session, session);
 });
 
 test('engine: the debug knob prices the window and states what actually gated', { skip }, async () => {
-  const routePressure = deriveRoutePressure(65_535, 0.9, 32_000);
+  const routePressure = Config.deriveRoutePressure(65_535, 0.9, 32_000);
   const { Session, session, engine, agent } = await fcSetup({
     debug: true,
     derivedHeadroom: {
@@ -313,7 +331,7 @@ test('engine: the debug knob prices the window and states what actually gated', 
   // messages can hold once the reply is reserved — 90% of 65,535 on this route sits
   // past its message budget, so pressure fires at the last reachable step instead.
   const entry = engine.pressureTable.perRoute[0];
-  assert.equal(entry.headroomTokens, deriveRoutePressure(65_535, 0.9, 32_000).headroomTokens, 'the route\'s derived headroom');
+  assert.equal(entry.headroomTokens, Config.deriveRoutePressure(65_535, 0.9, 32_000).headroomTokens, 'the route\'s derived headroom');
   assert.equal(stats.outputReserved, 32_000, 'and its reserved output come from the adapter, not the row');
   assert.equal(stats.messageBudget, 33_535, 'the usable message budget of that route');
   assert.equal(stats.requestedGateTokens, Math.ceil(65_535 * 0.9), 'the raw 90% share of the WINDOW, reported untouched');
@@ -336,9 +354,9 @@ test('engine: the debug knob prices the window and states what actually gated', 
 
   // `debug` also leaves our compiled window on disk: one file in debug/ under the
   // process working directory, named from the session id and shadowed range. The
-  // dump holds ONLY what our compiler emitted — the base applies its own
-  // preamble + `<compacted-summary>` frame around it upstream, so the framed
-  // message and the dump differ by exactly that wrapper.
+  // dump holds ONLY what our compiler emitted — the base adds its preamble
+  // upstream (and lands its trailing close tag on our reopened pair), so the
+  // framed message and the dump differ by exactly that wrapper.
   assert.ok(typeof stats.debugDumpPath === 'string' && stats.debugDumpPath.length > 0, 'the accounting names the dump file');
   assert.ok(stats.debugDumpPath.startsWith(`${dumpDir}${sep}`), 'in debug/ under the working directory');
   const dumped = await readFile(stats.debugDumpPath, 'utf8');
@@ -346,7 +364,7 @@ test('engine: the debug knob prices the window and states what actually gated', 
   assert.ok(Array.isArray(compiled) && compiled.length === 1 && typeof compiled[0]?.text === 'string', 'the summary event names what our compiler emitted');
   assert.equal(dumped, compiled[0].text, 'and it holds EXACTLY that compiled body, stats block included');
   assert.ok(text.includes(compiled[0].text), 'and the session message carries that same body inside the upstream frame');
-  assert.ok(!dumped.includes('automatically generated checkpoint') && !dumped.includes('<compacted-summary>'), 'no upstream framing in the dump — only our part');
+  assert.ok(!dumped.includes('automatically generated checkpoint'), 'no upstream preamble in the dump — the base frame stays upstream of our split tags');
   const freshDumps = (await readdir(dumpDir)).filter((name) => !existingDumps.has(name));
   assert.equal(freshDumps.length, 1, 'exactly one new file for this compaction');
   assert.match(freshDumps[0], /^session-engine-test-\d+-seq\d+-\d+\.txt$/, 'named from the session id and seq range');
@@ -367,7 +385,7 @@ test('engine: the debug knob prices the window and states what actually gated', 
 });
 
 test('engine: the pressure gate governs the MESSAGES, not the envelope of tool schemas', { skip }, async () => {
-  const routePressure = deriveRoutePressure(65_535, 0.9, 32_000);
+  const routePressure = Config.deriveRoutePressure(65_535, 0.9, 32_000);
   // Our gate is the row's share of the WINDOW (58,982 on W=65,535), read against the
   // meter's surface-only reading. The base instead decides on its own envelope
   // threshold — the same share capped at the message budget minus the derived margin
@@ -397,7 +415,7 @@ test('engine: the pressure gate governs the MESSAGES, not the envelope of tool s
 });
 
 test('engine: a route the mount table never named still gets its real gate', { skip }, async () => {
-  const routePressure = deriveRoutePressure(65_535, 0.9, 32_000);
+  const routePressure = Config.deriveRoutePressure(65_535, 0.9, 32_000);
   // perRoute EMPTY: the profile's capacities were not readable while the plugin
   // mounted (the web GUI loads providers after mounting), so nothing could name a
   // gate at mount. learnRoute reads the window straight from the session — the

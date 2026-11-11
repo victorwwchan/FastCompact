@@ -15,6 +15,12 @@
  * proves the injected classes carry the methods this engine calls, before any
  * session work happens.
  *
+ * The surface is one class: `Runtime` groups host resolution as static methods
+ * — version policy (`compareVersions`, `classifyVersion`), locating the package
+ * root, and `loadRuntime`, which returns the host classes plus their contract
+ * check. The version constants stay module-level exports because they are
+ * plain data, not behaviour.
+ *
  * @module dsh-fast-compact/lib/runtime
  */
 
@@ -37,112 +43,116 @@ export const TESTED_DSH_VERSIONS = Object.freeze(['0.2.1-rc.2']);
  */
 export const SUPPORTED_DSH_RANGE = Object.freeze({ min: '0.1.5-rc.2', below: '0.3.0' });
 
-/** Compare two semver strings, prerelease aware (`0.1.7-rc.2` < `0.1.7`). */
-export function compareVersions(left, right) {
-  const parse = (version) => {
-    const [core, pre] = String(version).split('-', 2);
-    return { core: core.split('.').map((part) => Number.parseInt(part, 10) || 0), pre: pre === undefined ? null : pre.split('.') };
-  };
-  const a = parse(left);
-  const b = parse(right);
-  for (let index = 0; index < 3; index += 1) {
-    if ((a.core[index] ?? 0) !== (b.core[index] ?? 0)) return (a.core[index] ?? 0) < (b.core[index] ?? 0) ? -1 : 1;
-  }
-  if (a.pre === null || b.pre === null) return a.pre === b.pre ? 0 : a.pre === null ? 1 : -1;
-  for (let index = 0; index < Math.max(a.pre.length, b.pre.length); index += 1) {
-    const x = a.pre[index];
-    const y = b.pre[index];
-    const nx = /^\d+$/.test(x) ? Number(x) : null;
-    const ny = /^\d+$/.test(y) ? Number(y) : null;
-    if (x === y) continue;
-    if (nx !== null && ny !== null) return nx < ny ? -1 : 1;
-    if (nx !== null || ny !== null) return nx !== null ? -1 : 1;
-    return x < y ? -1 : 1;
-  }
-  return 0;
-}
-
-/**
- * How a dsh version is treated.
- * @returns {'tested' | 'compatible' | 'unsupported' | 'unknown'}
- */
-export function classifyVersion(version) {
-  if (version === undefined) return 'unknown';
-  if (TESTED_DSH_VERSIONS.includes(version)) return 'tested';
-  // `below` excludes that release's prereleases too (0.3.0-alpha.1 is outside the range).
-  const core = String(version).split('-', 1)[0];
-  const inRange = compareVersions(version, SUPPORTED_DSH_RANGE.min) >= 0 && compareVersions(core, SUPPORTED_DSH_RANGE.below) < 0;
-  return inRange ? 'compatible' : 'unsupported';
-}
-
-/** Locate the dsh package root from the running CLI entry. */
-function harnessRoot(entry) {
-  let dir = dirname(realpathSync(entry));
-  for (let depth = 0; depth < 6; depth += 1) {
-    try {
-      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
-      if (pkg.name === '@deepseek-ai/dsh') return { dir, version: pkg.version };
-    } catch {
-      /* keep walking up */
+/** Host resolution for this plugin: version policy plus the loaded host classes. */
+export class Runtime {
+  /** Compare two semver strings, prerelease aware (`0.1.7-rc.2` < `0.1.7`). */
+  static compareVersions(left, right) {
+    const parse = (version) => {
+      const [core, pre] = String(version).split('-', 2);
+      return { core: core.split('.').map((part) => Number.parseInt(part, 10) || 0), pre: pre === undefined ? null : pre.split('.') };
+    };
+    const a = parse(left);
+    const b = parse(right);
+    for (let index = 0; index < 3; index += 1) {
+      if ((a.core[index] ?? 0) !== (b.core[index] ?? 0)) return (a.core[index] ?? 0) < (b.core[index] ?? 0) ? -1 : 1;
     }
-    dir = dirname(dir);
+    if (a.pre === null || b.pre === null) return a.pre === b.pre ? 0 : a.pre === null ? 1 : -1;
+    for (let index = 0; index < Math.max(a.pre.length, b.pre.length); index += 1) {
+      const x = a.pre[index];
+      const y = b.pre[index];
+      const nx = /^\d+$/.test(x) ? Number(x) : null;
+      const ny = /^\d+$/.test(y) ? Number(y) : null;
+      if (x === y) continue;
+      if (nx !== null && ny !== null) return nx < ny ? -1 : 1;
+      if (nx !== null || ny !== null) return nx !== null ? -1 : 1;
+      return x < y ? -1 : 1;
+    }
+    return 0;
   }
-  return undefined;
-}
 
-function importFrom(require, specifier) {
-  return import(pathToFileURL(require.resolve(specifier)).href);
-}
+  /**
+   * How a dsh version is treated.
+   * @returns {'tested' | 'compatible' | 'unsupported' | 'unknown'}
+   */
+  static classifyVersion(version) {
+    if (version === undefined) return 'unknown';
+    if (TESTED_DSH_VERSIONS.includes(version)) return 'tested';
+    // `below` excludes that release's prereleases too (0.3.0-alpha.1 is outside the range).
+    const core = String(version).split('-', 1)[0];
+    const inRange = Runtime.compareVersions(version, SUPPORTED_DSH_RANGE.min) >= 0
+      && Runtime.compareVersions(core, SUPPORTED_DSH_RANGE.below) < 0;
+    return inRange ? 'compatible' : 'unsupported';
+  }
 
-/**
- * Load the harness classes this plugin builds on.
- * @param {string} [harnessEntry] - path of the running dsh CLI (defaults to argv[1]).
- * @param {{ allowUntested?: boolean }} [options]
- */
-export async function loadRuntime(harnessEntry = process.argv[1], options = {}) {
-  if (!harnessEntry) throw new Error('dsh-fast-compact: cannot locate the running dsh; set harnessEntry');
-  const root = harnessRoot(harnessEntry);
-  const status = classifyVersion(root?.version);
-  if (status === 'unsupported' && options.allowUntested !== true) {
-    throw new Error(`dsh-fast-compact: dsh ${root.version} is outside the supported range (>= ${SUPPORTED_DSH_RANGE.min} and < ${SUPPORTED_DSH_RANGE.below}); refusing to load. Set allowUntestedHarness: true to override.`);
+  /** Locate the dsh package root from the running CLI entry. */
+  static harnessRoot(entry) {
+    let dir = dirname(realpathSync(entry));
+    for (let depth = 0; depth < 6; depth += 1) {
+      try {
+        const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+        if (pkg.name === '@deepseek-ai/dsh') return { dir, version: pkg.version };
+      } catch {
+        /* keep walking up */
+      }
+      dir = dirname(dir);
+    }
+    return undefined;
   }
-  const require = createRequire(realpathSync(harnessEntry));
-  const [compaction, basic, llm, tools] = await Promise.all([
-    importFrom(require, '@deepseek-ai/dsh-compaction'),
-    importFrom(require, '@deepseek-ai/dsh-compaction-basic'),
-    importFrom(require, '@deepseek-ai/dsh-llm'),
-    importFrom(require, '@deepseek-ai/dsh-tools'),
-  ]);
-  const runtime = {
-    version: root?.version,
-    versionStatus: status,
-    CompactionEngine: compaction.CompactionEngine,
-    BasicCompactionEngine: basic.BasicCompactionEngine,
-    ManualCompactionError: compaction.ManualCompactionError,
-    CompactionId: compaction.CompactionId,
-    compactCheckpointSource: compaction.compactCheckpointSource,
-    toolPairingBalancedBefore: compaction.toolPairingBalancedBefore,
-    toolPairingBalancedAfter: compaction.toolPairingBalancedAfter,
-    createUserMessage: llm.createUserMessage,
-    errorChain: llm.errorChain,
-    freezeMessage: llm.freezeMessage,
-    HarnessError: llm.HarnessError,
-    CONTEXT_WINDOW_EXCEEDED_CODE: llm.CONTEXT_WINDOW_EXCEEDED_CODE,
-    defineTool: tools.defineTool,
-  };
-  // Contract check: every export this plugin uses must exist with the right
-  // shape, and the official base class must still carry the hook we override
-  // plus the protocol methods our subclass depends on. A dsh that renamed or
-  // removed any of them is refused, whatever its version says.
-  const missing = Object.entries(runtime)
-    .filter(([key, value]) => !['version', 'versionStatus'].includes(key) && (key === 'CONTEXT_WINDOW_EXCEEDED_CODE' ? typeof value !== 'string' : typeof value !== 'function'))
-    .map(([key]) => key);
-  const baseMethods = ['summarize', 'compactIfNeeded', 'compactRegion', 'compactNow', 'regionDependencies'];
-  const missingHooks = typeof runtime.BasicCompactionEngine === 'function'
-    ? baseMethods.filter((method) => typeof runtime.BasicCompactionEngine.prototype?.[method] !== 'function').map((method) => `BasicCompactionEngine.${method}`)
-    : [];
-  if (missing.length + missingHooks.length > 0 && options.allowUntested !== true) {
-    throw new Error(`dsh-fast-compact: dsh ${root?.version ?? '(unknown)'} lacks ${[...missing, ...missingHooks].join(', ')}; refusing to load (this dsh is not compatible with this plugin version)`);
+
+  static importFrom(require, specifier) {
+    return import(pathToFileURL(require.resolve(specifier)).href);
   }
-  return runtime;
+
+  /**
+   * Load the harness classes this plugin builds on.
+   * @param {string} [harnessEntry] - path of the running dsh CLI (defaults to argv[1]).
+   * @param {{ allowUntested?: boolean }} [options]
+   */
+  static async loadRuntime(harnessEntry = process.argv[1], options = {}) {
+    if (!harnessEntry) throw new Error('dsh-fast-compact: cannot locate the running dsh; set harnessEntry');
+    const root = Runtime.harnessRoot(harnessEntry);
+    const status = Runtime.classifyVersion(root?.version);
+    if (status === 'unsupported' && options.allowUntested !== true) {
+      throw new Error(`dsh-fast-compact: dsh ${root.version} is outside the supported range (>= ${SUPPORTED_DSH_RANGE.min} and < ${SUPPORTED_DSH_RANGE.below}); refusing to load. Set allowUntestedHarness: true to override.`);
+    }
+    const require = createRequire(realpathSync(harnessEntry));
+    const [compaction, basic, llm, tools] = await Promise.all([
+      Runtime.importFrom(require, '@deepseek-ai/dsh-compaction'),
+      Runtime.importFrom(require, '@deepseek-ai/dsh-compaction-basic'),
+      Runtime.importFrom(require, '@deepseek-ai/dsh-llm'),
+      Runtime.importFrom(require, '@deepseek-ai/dsh-tools'),
+    ]);
+    const runtime = {
+      version: root?.version,
+      versionStatus: status,
+      CompactionEngine: compaction.CompactionEngine,
+      BasicCompactionEngine: basic.BasicCompactionEngine,
+      ManualCompactionError: compaction.ManualCompactionError,
+      CompactionId: compaction.CompactionId,
+      compactCheckpointSource: compaction.compactCheckpointSource,
+      toolPairingBalancedBefore: compaction.toolPairingBalancedBefore,
+      toolPairingBalancedAfter: compaction.toolPairingBalancedAfter,
+      createUserMessage: llm.createUserMessage,
+      errorChain: llm.errorChain,
+      freezeMessage: llm.freezeMessage,
+      HarnessError: llm.HarnessError,
+      CONTEXT_WINDOW_EXCEEDED_CODE: llm.CONTEXT_WINDOW_EXCEEDED_CODE,
+      defineTool: tools.defineTool,
+    };
+    // Contract check: every export this plugin uses must exist with the right
+    // shape, and the official base class must still carry the hook we override
+    // plus the protocol methods our subclass depends on. A dsh that renamed or
+    // removed any of them is refused, whatever its version says.
+    const missing = Object.entries(runtime)
+      .filter(([key, value]) => !['version', 'versionStatus'].includes(key) && (key === 'CONTEXT_WINDOW_EXCEEDED_CODE' ? typeof value !== 'string' : typeof value !== 'function'))
+      .map(([key]) => key);
+    const baseMethods = ['summarize', 'compactIfNeeded', 'compactRegion', 'compactNow', 'regionDependencies'];
+    const missingHooks = typeof runtime.BasicCompactionEngine === 'function'
+      ? baseMethods.filter((method) => typeof runtime.BasicCompactionEngine.prototype?.[method] !== 'function').map((method) => `BasicCompactionEngine.${method}`)
+      : [];
+    if (missing.length + missingHooks.length > 0 && options.allowUntested !== true) {
+      throw new Error(`dsh-fast-compact: dsh ${root?.version ?? '(unknown)'} lacks ${[...missing, ...missingHooks].join(', ')}; refusing to load (this dsh is not compatible with this plugin version)`);
+    }
+    return runtime;
+  }
 }

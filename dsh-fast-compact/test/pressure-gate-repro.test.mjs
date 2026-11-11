@@ -48,9 +48,9 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { findDsh } from '../scripts/find-dsh.mjs';
-import { loadRuntime } from '../lib/runtime.mjs';
-import { createEngineClass } from '../lib/engine.mjs';
-import { deriveRoutePressure } from '../lib/config.mjs';
+import { Runtime } from '../lib/runtime.mjs';
+import { Engine } from '../lib/engine.mjs';
+import { Config } from '../lib/config.mjs';
 import { buildEvents } from './helpers.mjs';
 
 const entry = findDsh();
@@ -67,14 +67,14 @@ const ROW = { thresholdRatio: 0.8, retainRatio: 0.12, compactionRetries: 1, auto
 
 async function harness() {
   if (harness.loaded === undefined) {
-    const runtime = await loadRuntime(entry, { allowUntested: true });
+    const runtime = await Runtime.loadRuntime(entry, { allowUntested: true });
     const require = createRequire(entry);
     const { Session } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-session')).href);
     const { TokenMeter } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-token-meter')).href);
     harness.loaded = {
       Session,
       estimate: TokenMeter.prototype.estimateMessage,
-      Engine: createEngineClass(runtime),
+      Engine: Engine.createEngineClass(runtime),
     };
   }
   return harness.loaded;
@@ -141,7 +141,7 @@ async function setup(turns, tools) {
   events.push({ type: 'turn/start', seq: events.length, time: last.time + 1, data: { turn: (last.data?.turn ?? turns) + 1 } });
   const session = Session.create('pressure-repro', events);
   const logs = [];
-  const pressureTable = deriveRoutePressure(WINDOW, ROW.thresholdRatio, OUTPUT_RESERVED);
+  const pressureTable = Config.deriveRoutePressure(WINDOW, ROW.thresholdRatio, OUTPUT_RESERVED);
   const perRoute = {
     provider: 'p', model: 'm', contextWindow: WINDOW, defaultMaxTokens: OUTPUT_RESERVED,
     headroomTokens: pressureTable.headroomTokens, thresholdRatio: pressureTable.thresholdRatio,

@@ -1,5 +1,18 @@
 # dsh-fast-compact
 
+## What problem it solves
+
+This plugin mainly solves two problems:
+
+1. **The model's long summarizing time during compaction.** Normal compaction burns a
+   whole LLM round-trip writing a summary; this engine skips that step entirely.
+   Without it, the session runs ~90% faster and smoother — no mid-conversation
+   stalls while the model rewrites its own history.
+2. **Small context windows (e.g. 64 KB).** With Fast Compact, a small window feels like
+   an infinite one: compacted history becomes tiny `seq` pointers instead of prose, so it
+   never eats the window you have left. That lets you run larger models at a reasonable
+   speed instead of being forced onto a smaller one to fit the window.
+
 The idea is simple: **make compaction fast by not using a model at all.** A normal
 compaction spends a whole LLM round-trip writing prose that the next turn then has to
 re-read. This engine skips that step — compaction is computed locally and deterministically
@@ -15,42 +28,46 @@ dropped tool call/result becomes a one-line `seq` pointer the resumed model can 
 
 ## Quick start
 
-The engine is on npm as **`dsh-fast-compact`**; the installable unit is still the preset
-bundle **`dsh-fast-compact-preset`** (it carries the live `fast-compact` compaction row),
-which is not published yet — take it from this repository. A DSH profile is an npm project
-(`~/.dsh/profiles/<name>`, `%USERPROFILE%\.dsh\profiles\<name>` on Windows), so installing
-means: add the two packages as dependencies, select the preset bundle, pick the preset,
-restart. Requires Node `^22.19.0 || >=24.0.0` and dsh `>=0.1.5-rc.2 <0.3.0`.
+Fast Compact ships as **two npm packages**: `dsh-fast-compact` (the engine) and
+**`dsh-fast-compact-preset`** (the "standard" preset bundle; its compaction row points at
+the engine by name, so both must be direct dependencies of the profile). A DSH profile is
+an npm project (`%USERPROFILE%\.dsh\profiles\<name>` on Windows,
+`~/.dsh/profiles/<name>` elsewhere); installing means adding both packages to the profile's
+dependencies and to its `dsh.profile.bundles` list, then picking the preset. Requires Node
+`^22.19.0 || >=24.0.0` and dsh `>=0.1.5-rc.2 <0.3.0`.
+
+### 1. DSH UI (Web)
+
+Open **Plugins** in the Web sidebar and use **Add plugin** to install
+`dsh-fast-compact` and `dsh-fast-compact-preset` one after the other — installing a bundle
+registers it in the profile's `dsh.profile.bundles` automatically. Then pick
+**Fast Compact (standard)** in the preset picker and start a **new** session (running
+sessions keep their own projection).
+
+### 2. DSH CLI (`dsh plugin add`)
 
 ```sh
-# 1. install the engine from npm into your profile
-cd ~/.dsh/profiles/web                    # any profile you maintain
-npm install dsh-fast-compact@^0.1.0
-
-# 2. add the preset bundle from a checkout of this repository (not on npm yet)
-git clone https://github.com/victorwwchan/FastCompact /tmp/fast-compact-src
-npm install /tmp/fast-compact-src/dsh-fast-compact-preset
+dsh plugin --profile web add dsh-fast-compact dsh-fast-compact-preset   # pnpm add, both packages
 ```
 
-3. In the profile's `package.json`, select the bundles:
+`dsh plugin add` forwards to pnpm verbatim and does **not** touch `bundles` — afterwards
+add both names to the profile's `package.json`:
 
-   ```json
-   { "dsh": { "profile": { "bundles": ["dsh-fast-compact-preset", "dsh-fast-compact"] } } }
-   ```
+```json
+{ "dsh": { "profile": { "bundles": ["dsh-fast-compact-preset", "dsh-fast-compact"] } } }
+```
 
-4. In the profile's own `cordis.patch.yml`, pick the preset (or choose
-   **Fast Compact (standard)** in the client UI's preset picker instead):
+Then select the preset: pick **Fast Compact (standard)** in the client UI, or set it in
+the profile's own `cordis.patch.yml`:
 
-   ```yaml
-   - id: agent-preset-registry
-     name: "@deepseek-ai/dsh-agent-preset-registry"
-     config:
-       selectedDefault: fast-compact
-   ```
+```yaml
+- id: agent-preset-registry
+  name: "@deepseek-ai/dsh-agent-preset-registry"
+  config:
+    selectedDefault: fast-compact
+```
 
-5. Restart dsh and start a **new** session — running sessions keep their own preset
-   projection. Until `dsh-fast-compact-preset` reaches npm, step 2 stays a path install
-   (once published it becomes `npm install dsh-fast-compact-preset`).
+Restart dsh and start a **new** session — running sessions keep their own preset projection.
 
 ## Engine surface
 
@@ -92,11 +109,16 @@ excerpts:
    The section is CUMULATIVE — when the span opens with a checkpoint an earlier
    compaction wrote, that body's own reference lines are parsed back and re-emitted
    ahead of this span's, so seqs from every compacted span stay `recall`able for as
-   long as the session runs (see below),
-7. `## Session-log instruction` — the built-in resume guidance.
+   long as the session runs (see below).
 
-The base supplies the framing (`<compacted-summary>`, "automatically generated
-checkpoint") around the body; this package adds no frame tags of its own. Reference-line
+The resume guidance rides OUTSIDE the summary: the base frames our text in one
+`<compacted-summary>` pair after its preamble, and the compiler splits that pair —
+it closes the tag right after the header zone (currently blank), carries the instruction
+in its own `<system prompt>` / `</system prompt>` pair, then reopens a second
+`<compacted-summary>` around the body; the base trailing close tag lands on the
+reopened pair, so every tag stays balanced. The resumed model reads the guidance as
+harness-level before the summary prose starts, and `instructions: ''` drops the whole
+pair. Reference-line
 shapes (`refLineFormat`):
 
 | shape | line |
@@ -124,6 +146,37 @@ is never parsed for seqs; the body's own reference lines (`carriedReferences`) a
 fallback for traffic the brackets do not cover. The byte budget then ages traffic oldest-
 first (a fold line counts the inherited calls too, e.g. `- 41 earlier calls: seq 12–880`),
 so history coarsens while its seqs stay named.
+
+## The plugin's own instruction, injected once per surface generation
+
+Separate from the checkpoint's `SESSION_LOG_INSTRUCTION` (which rides once per
+compaction, outside the summary frame): `index.mjs` exports its OWN
+`PLUGIN_INSTRUCTION` and registers an `agent/pre-step` middleware listener —
+the same point dsh-plan-mode and dsh-tool-skill use — that appends it as a
+user-role message built by the harness `createUserMessage`, framed
+`<system-reminder>…</system-reminder>` and stamped
+`source.kind: 'fastcompact-instruction'`. The ruleset therefore always sits at
+the live end of the window instead of aging back behind the history it grew
+over. It is NOT re-injected before every step (that rule spent the same text
+dozens of times across one session, and each copy cost its own window share
+while inflating the checkpoint's stats): the default arms once per SURFACE
+GENERATION — the copy stays live until a compaction replaces the surface, and
+only that replacement (`session.surface.replaceGeneration`) re-arms the mount,
+so a session carries one live copy per compaction cycle.
+
+Row knob `pluginInstructionInject` chooses the rule: `once` (default) = one
+live copy per surface generation; `pressure` = that copy also waits until the
+route's own pressure gate says compaction is due (the same
+`surfaceTokens >= gateTokens` comparison `compactIfNeeded` makes, read through
+the engine's public `pressureDue`), so an above-gate session the base has not
+compacted yet cannot stack copies — a route whose gate nobody can name falls
+back to `once`; `step` restores the old every-step rule.
+
+Its growth is bounded on the compaction side with ZERO compiler code: pins only
+keep `source.kind === 'user'` and context blocks only carry `CONTEXT_KINDS`, so
+this kind is neither — every older copy folds OUT at the next compaction and the
+listener supplies the fresh copy again. The text interpolates `${recallTool}` /
+`${searchTool}` against the tool names this row registered.
 
 ## Configuration (cordis row keys)
 
@@ -287,9 +340,11 @@ above); over any budget → oldest lines fold.
 The installable unit is the **preset bundle** `dsh-fast-compact-preset`: a copy
 of the shipped "standard" preset whose `compaction` isolate group carries this
 row (its `cordis.patch.yml` is already on the new keys — host-pressure keys plus
-`thoughtChars`, `refLineFormat`, `instructions`). Install the bundle, select
-preset `preset-fast-compact`, start a new session. This package's own `cordis.patch.yml` is a comment header plus an
-empty row list (`[]`) — installing it alone can never change the host boot.
+`thoughtChars`, `refLineFormat`, `instructions`). Install both packages into your
+profile (**Quick start** above covers the UI and CLI paths), select preset
+`fast-compact` (**Fast Compact (standard)**), start a new session. This package's own
+`cordis.patch.yml` is a comment header plus an empty row list (`[]`) — installing it
+alone can never change the host boot.
 
 The row REPLACES any other compaction engine in that isolate group (one
 `ctx.compaction` per context). It re-registers its own recall tools and the
@@ -353,9 +408,9 @@ no longer exists.)
 | [lib/pins.mjs](<lib/pins.mjs>) | Pinned-content selection (every user message kept). |
 | [lib/recall.mjs](<lib/recall.mjs>) | Recall-surface helpers used by the compiled instruction block. |
 | [lib/tools.mjs](<lib/tools.mjs>) | Tool-call/result plumbing for reference lines. |
-| [scripts/selfcheck.mjs](<scripts/selfcheck.mjs>) | 19 static + mount checks (`npm run selfcheck`). |
+| [scripts/selfcheck.mjs](<scripts/selfcheck.mjs>) | 20 static + mount checks (`npm run selfcheck`). |
 | [scripts/find-dsh.mjs](<scripts/find-dsh.mjs>) | DSH entry resolution (DSH_ENTRY → `where dsh` → npm global). |
-| [test/](<test/>) | 8 test files (100 tests) + fixtures; reports land in `test/out/`. |
+| [test/](<test/>) | 9 test files (103 tests) + fixtures; reports land in `test/out/`. |
 | [docs/reports/](<docs/reports/>) | The two field-test stress reports and their comparison (see above). |
 | [cordis.patch.yml](<cordis.patch.yml>) | Empty mount patch (comment header + `[]`). |
 | [LICENSE](<LICENSE>) | MIT, owned by vicschan. |
@@ -363,8 +418,8 @@ no longer exists.)
 ## Tests
 
 ```sh
-npm test        # node --test "test/*.test.mjs" — 100 tests (88 pure: config, measure, references, compiler, tools, pressure-gate-repro; 12 harness: engine, ref-formats-e2e)
-npm run selfcheck   # scripts/selfcheck.mjs — 19 static + mount checks
+npm test        # node --test "test/*.test.mjs" — 103 tests (91 pure: config, measure, references, compiler, plugin-instruction, tools, pressure-gate-repro; 12 harness: engine, ref-formats-e2e)
+npm run selfcheck   # scripts/selfcheck.mjs — 20 static + mount checks
 ```
 
 The `ref-formats-e2e` test compacts the latest real durable session log in both

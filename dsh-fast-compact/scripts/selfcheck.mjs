@@ -65,7 +65,7 @@ await check('static: version gate lives in lib/runtime.mjs (tested + supported)'
   const runtime = await import(pathToFileURL(join(pkgDir, 'lib', 'runtime.mjs')).href);
   assert.deepEqual([...runtime.TESTED_DSH_VERSIONS], ['0.2.1-rc.2'], 'tested set trimmed to the installed dsh');
   assert.deepEqual(runtime.SUPPORTED_DSH_RANGE, { min: '0.1.5-rc.2', below: '0.3.0' });
-  assert.equal(typeof runtime.loadRuntime, 'function');
+  assert.equal(typeof runtime.Runtime.loadRuntime, 'function', 'loadRuntime is the module-level entry');
 });
 
 await check('static: package metadata (dsh bundle patch, engine range, no npm deps)', () => {
@@ -97,12 +97,21 @@ await check('static: lib holds exactly our own modules, no dead duplicates', () 
 await check('static: our own block headings, and no vendored checkpoint frame', () => {
   const compiler = readFileSync(join(pkgDir, 'lib', 'compiler.mjs'), 'utf8');
   assert.ok(compiler.includes("'## State of work'"), 'state block heading is ours');
-  assert.ok(compiler.includes("'## Session-log instruction'"), 'instruction heading is ours');
+  assert.ok(compiler.includes("'<system prompt>'") && compiler.includes("'</system prompt>'"), 'the instruction frame pair is ours');
   assert.ok(compiler.includes("'## Session-log references (dropped tool traffic)'"), 'reference heading is ours');
   assert.ok(!compiler.includes('fastcompact-checkpoint'), 'no legacy frame tag: the base frames our body with its own <compacted-summary>');
   const engine = readFileSync(join(pkgDir, 'lib', 'engine.mjs'), 'utf8');
   assert.ok(/class FastCompactEngine extends Base/.test(engine), 'the engine subclasses the official base class');
   assert.ok(/async summarize\(input, agent, signal\)/.test(engine), 'summarize is the single hook we replace');
+});
+
+await check('static: the mount carries its OWN instruction and arms it once per surface generation', () => {
+  const index = readFileSync(join(pkgDir, 'index.mjs'), 'utf8');
+  assert.ok(/export const PLUGIN_INSTRUCTION =/.test(index), 'the plugin owns its own instruction text, apart from the compiler SESSION_LOG_INSTRUCTION');
+  assert.ok(/ctx\.on\('agent\/pre-step'/.test(index), 'a pre-step listener registers at mount');
+  assert.ok(/session\?\.surface\?\.replaceGeneration/.test(index), 'the listener arms against the surface generation, so a compaction — not a step — re-arms it');
+  assert.ok(/source: \{ kind: PLUGIN_INSTRUCTION_SOURCE_KIND \}/.test(index), 'injections carry their own source kind, invisible to the compiler so they fold out at compaction');
+  assert.ok(/runtime\.createUserMessage\(/.test(index), 'injections are built by the harness message factory from the loaded runtime');
 });
 
 // ----------------------------------------------------------------- mount ---
@@ -211,6 +220,22 @@ await check('mount: the debug trail knobs ride through (default off, on when ask
   assert.equal(onOptions.debug, true, 'debug:true reaches the engine and turns the trail on');
   assert.equal(onOptions.debugChars, 80, 'debugChars:80 reaches the engine and clips each entry');
   await onFiber.dispose();
+  await settle();
+});
+
+await check('mount: the plugin-instruction arming knob rides through (default once per generation)', async () => {
+  const { ctx } = await rootContext();
+  const fiber = ctx.plugin(indexMod, { harnessEntry: entry });
+  await fiber;
+  await settle();
+  assert.equal(ctx.get('compaction').options.pluginInstructionInject, 'once', 'default arms one live copy per surface generation');
+  await fiber.dispose();
+  await settle();
+  const stepFiber = ctx.plugin(indexMod, { harnessEntry: entry, pluginInstructionInject: 'pressure' });
+  await stepFiber;
+  await settle();
+  assert.equal(ctx.get('compaction').options.pluginInstructionInject, 'pressure', 'the row knob reaches the mount rule');
+  await stepFiber.dispose();
   await settle();
 });
 
@@ -361,6 +386,14 @@ await check('mount: a bad value for one of our own keys fails at mount', async (
   await assert.rejects(
     Promise.resolve(ctx.plugin(indexMod, { harnessEntry: entry, thoughtChars: -1 })),
     /thoughtChars/,
+  );
+});
+
+await check('mount: a bad pluginInstructionInject mode fails at mount', async () => {
+  const { ctx } = await rootContext();
+  await assert.rejects(
+    Promise.resolve(ctx.plugin(indexMod, { harnessEntry: entry, pluginInstructionInject: 'always' })),
+    /pluginInstructionInject must be one of/,
   );
 });
 

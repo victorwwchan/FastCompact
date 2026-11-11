@@ -1,5 +1,18 @@
 # dsh-fast-compact
 
+## What problem it solves
+
+This plugin mainly solves two problems:
+
+1. **The model's long summarizing time during compaction.** Normal compaction burns a
+   whole LLM round-trip writing a summary; this engine skips that step entirely.
+   Without it, the session runs ~90% faster and smoother — no mid-conversation
+   stalls while the model rewrites its own history.
+2. **Small context windows (e.g. 64 KB).** With Fast Compact, a small window feels like
+   an infinite one: compacted history becomes tiny `seq` pointers instead of prose, so it
+   never eats the window you have left. That lets you run larger models at a reasonable
+   speed instead of being forced onto a smaller one to fit the window.
+
 The idea is simple: **make compaction fast by not using a model at all.** A normal
 compaction spends a whole LLM round-trip writing prose that the next turn then has to
 re-read. This engine skips that step — compaction is computed locally and deterministically
@@ -96,11 +109,16 @@ excerpts:
    The section is CUMULATIVE — when the span opens with a checkpoint an earlier
    compaction wrote, that body's own reference lines are parsed back and re-emitted
    ahead of this span's, so seqs from every compacted span stay `recall`able for as
-   long as the session runs (see below),
-7. `## Session-log instruction` — the built-in resume guidance.
+   long as the session runs (see below).
 
-The base supplies the framing (`<compacted-summary>`, "automatically generated
-checkpoint") around the body; this package adds no frame tags of its own. Reference-line
+The resume guidance rides OUTSIDE the summary: the base frames our text in one
+`<compacted-summary>` pair after its preamble, and the compiler splits that pair —
+it closes the tag right after the header zone (currently blank), carries the instruction
+in its own `<system prompt>` / `</system prompt>` pair, then reopens a second
+`<compacted-summary>` around the body; the base trailing close tag lands on the
+reopened pair, so every tag stays balanced. The resumed model reads the guidance as
+harness-level before the summary prose starts, and `instructions: ''` drops the whole
+pair. Reference-line
 shapes (`refLineFormat`):
 
 | shape | line |
@@ -128,6 +146,37 @@ is never parsed for seqs; the body's own reference lines (`carriedReferences`) a
 fallback for traffic the brackets do not cover. The byte budget then ages traffic oldest-
 first (a fold line counts the inherited calls too, e.g. `- 41 earlier calls: seq 12–880`),
 so history coarsens while its seqs stay named.
+
+## The plugin's own instruction, injected once per surface generation
+
+Separate from the checkpoint's `SESSION_LOG_INSTRUCTION` (which rides once per
+compaction, outside the summary frame): `index.mjs` exports its OWN
+`PLUGIN_INSTRUCTION` and registers an `agent/pre-step` middleware listener —
+the same point dsh-plan-mode and dsh-tool-skill use — that appends it as a
+user-role message built by the harness `createUserMessage`, framed
+`<system-reminder>…</system-reminder>` and stamped
+`source.kind: 'fastcompact-instruction'`. The ruleset therefore always sits at
+the live end of the window instead of aging back behind the history it grew
+over. It is NOT re-injected before every step (that rule spent the same text
+dozens of times across one session, and each copy cost its own window share
+while inflating the checkpoint's stats): the default arms once per SURFACE
+GENERATION — the copy stays live until a compaction replaces the surface, and
+only that replacement (`session.surface.replaceGeneration`) re-arms the mount,
+so a session carries one live copy per compaction cycle.
+
+Row knob `pluginInstructionInject` chooses the rule: `once` (default) = one
+live copy per surface generation; `pressure` = that copy also waits until the
+route's own pressure gate says compaction is due (the same
+`surfaceTokens >= gateTokens` comparison `compactIfNeeded` makes, read through
+the engine's public `pressureDue`), so an above-gate session the base has not
+compacted yet cannot stack copies — a route whose gate nobody can name falls
+back to `once`; `step` restores the old every-step rule.
+
+Its growth is bounded on the compaction side with ZERO compiler code: pins only
+keep `source.kind === 'user'` and context blocks only carry `CONTEXT_KINDS`, so
+this kind is neither — every older copy folds OUT at the next compaction and the
+listener supplies the fresh copy again. The text interpolates `${recallTool}` /
+`${searchTool}` against the tool names this row registered.
 
 ## Configuration (cordis row keys)
 
@@ -359,9 +408,9 @@ no longer exists.)
 | [lib/pins.mjs](<lib/pins.mjs>) | Pinned-content selection (every user message kept). |
 | [lib/recall.mjs](<lib/recall.mjs>) | Recall-surface helpers used by the compiled instruction block. |
 | [lib/tools.mjs](<lib/tools.mjs>) | Tool-call/result plumbing for reference lines. |
-| [scripts/selfcheck.mjs](<scripts/selfcheck.mjs>) | 19 static + mount checks (`npm run selfcheck`). |
+| [scripts/selfcheck.mjs](<scripts/selfcheck.mjs>) | 20 static + mount checks (`npm run selfcheck`). |
 | [scripts/find-dsh.mjs](<scripts/find-dsh.mjs>) | DSH entry resolution (DSH_ENTRY → `where dsh` → npm global). |
-| [test/](<test/>) | 8 test files (100 tests) + fixtures; reports land in `test/out/`. |
+| [test/](<test/>) | 9 test files (103 tests) + fixtures; reports land in `test/out/`. |
 | [docs/reports/](<docs/reports/>) | The two field-test stress reports and their comparison (see above). |
 | [cordis.patch.yml](<cordis.patch.yml>) | Empty mount patch (comment header + `[]`). |
 | [LICENSE](<LICENSE>) | MIT, owned by vicschan. |
@@ -369,8 +418,8 @@ no longer exists.)
 ## Tests
 
 ```sh
-npm test        # node --test "test/*.test.mjs" — 100 tests (88 pure: config, measure, references, compiler, tools, pressure-gate-repro; 12 harness: engine, ref-formats-e2e)
-npm run selfcheck   # scripts/selfcheck.mjs — 19 static + mount checks
+npm test        # node --test "test/*.test.mjs" — 103 tests (91 pure: config, measure, references, compiler, plugin-instruction, tools, pressure-gate-repro; 12 harness: engine, ref-formats-e2e)
+npm run selfcheck   # scripts/selfcheck.mjs — 20 static + mount checks
 ```
 
 The `ref-formats-e2e` test compacts the latest real durable session log in both

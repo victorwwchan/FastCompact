@@ -41,12 +41,12 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { findDsh } from '../scripts/find-dsh.mjs';
-import { loadRuntime } from '../lib/runtime.mjs';
-import { createEngineClass, ENGINE_PROVIDER, ENGINE_MODEL } from '../lib/engine.mjs';
-import { buildCheckpoint, userMessages, humanTurns, PINNED_OPEN, carriedReferences, shadowedCallEntries, shadowedHumanEntries } from '../lib/compiler.mjs';
-import { recall } from '../lib/recall.mjs';
+import { Runtime } from '../lib/runtime.mjs';
+import { Engine, ENGINE_PROVIDER, ENGINE_MODEL } from '../lib/engine.mjs';
+import { Compiler, PINNED_OPEN } from '../lib/compiler.mjs';
+import { Recall } from '../lib/recall.mjs';
 import { REF_LINE_FORMATS, REFERENCES_BLOCK_BYTES, DEFAULT_RETAIN_LENGTH, DEFAULT_CONTEXT_MAX_RATIO } from '../lib/config.mjs';
-import { pinsFor } from '../lib/pins.mjs';
+import { Pins } from '../lib/pins.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url)); // dsh-fast-compact\test
 const OUT_DIR = join(HERE, 'out');
@@ -220,7 +220,7 @@ function closeOpenTurn(events) {
 function humanBearingCut(events) {
   const cpSeqs = events.filter((event) => event.type === 'user/message' && event.data?.source?.kind === 'compact-checkpoint')
     .map((event) => event.seq);
-  const humans = userMessages(events);
+  const humans = Compiler.userMessages(events);
   for (let i = cpSeqs.length - 2; i >= 0; i -= 1) {
     const between = humans.filter((entry) => entry.seq > cpSeqs[i] && entry.seq < cpSeqs[i + 1]);
     if (between.length === 0) continue;
@@ -236,11 +236,11 @@ let runtimeModules;
 
 async function ensureRuntime() {
   if (runtimeModules === undefined) {
-    const runtime = await loadRuntime(entry, { allowUntested: true });
+    const runtime = await Runtime.loadRuntime(entry, { allowUntested: true });
     const require = createRequire(entry);
     const { Session } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-session')).href);
     const { TokenMeter } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-token-meter')).href);
-    runtimeModules = { Session, TokenMeter, Engine: createEngineClass(runtime) };
+    runtimeModules = { Session, TokenMeter, Engine: Engine.createEngineClass(runtime) };
   }
   return runtimeModules;
 }
@@ -428,7 +428,7 @@ function pinLines(body) {
   }
   return out;
 }
-const INSTRUCTION_HEADING = '## Session-log instruction';
+const SYSTEM_PROMPT_OPEN_TAG = '<system prompt>';
 const FRAME_CLOSE = '</compacted-summary>';
 
 /** Every occurrence of the reference header in a checkpoint text. */
@@ -613,7 +613,7 @@ test('refLineFormat e2e on the committed sample session log', { skip }, async ()
     assert.ok(run.text.includes('<compacted-summary>'), `${run.format}: the base frame still wraps our body`);
     assert.ok(run.text.includes('automatically generated checkpoint'), 'and the preamble is the base\'s own words');
     assert.ok(run.text.includes('## State of work'), 'our state block survived into the window');
-    assert.ok(run.text.includes(INSTRUCTION_HEADING), 'and the resume instructions');
+    assert.ok(!run.text.includes(SYSTEM_PROMPT_OPEN_TAG), 'the default body carries no instruction pair: the mount injects that copy per surface generation');
     run.section = ownSection(run.text);
     assert.ok(run.section !== null, `${run.format} @ ${run.thoughtChars}: emitted its own reference section`);
     assert.equal(headerPositions(run.text).length, headerPositions(runs.find((r) => r.format === 'none').text).length,
@@ -661,7 +661,7 @@ test('refLineFormat e2e on the committed sample session log', { skip }, async ()
             assert.ok(opensWithPointer, `thought @ ${run.thoughtChars}: a malformed label (${line})`);
             const previous = index > 0 ? run.section.refLines[index - 1] : undefined;
             assert.ok(previous !== undefined && pointer(previous) === pointer(line),
-              `thought @ ${run.thoughtChars}: a bare thought pointer must continue a run the line above quoted (${line})`);
+              `thought @ ${run.thoughtChars}: a bare thought pointer must continue a run the line above Measure.quoted(${line})`);
           }
         }
       }
@@ -683,7 +683,7 @@ test('refLineFormat e2e on the committed sample session log', { skip }, async ()
       return m && m[1];
     };
     if (pointer(thoughtRun.section.refLines[i]) === pointer(thoughtRun.section.refLines[i - 1]) && pointer(thoughtRun.section.refLines[i]) !== undefined) {
-      assert.ok(!(quoted(thoughtRun.section.refLines[i]) && quoted(thoughtRun.section.refLines[i - 1])),
+      assert.ok(!(Measure.quoted(thoughtRun.section.refLines[i]) && Measure.quoted(thoughtRun.section.refLines[i - 1])),
         'thought: one shared thought quotes its excerpt on more than the first line of the run');
     }
   }
@@ -721,7 +721,7 @@ test('refLineFormat e2e on the committed sample session log', { skip }, async ()
     for (const n of run.numbers) {
       let restored;
       try {
-        restored = recall(run.session, { seq: n }, { maxChars: 10_000 });
+        restored = Recall.recall(run.session, { seq: n }, { maxChars: 10_000 });
       } catch (error) {
         assert.fail(`pointer seq ${n} in ${run.format} @ ${run.thoughtChars} is not restorable: ${error.message}`);
       }
@@ -731,7 +731,7 @@ test('refLineFormat e2e on the committed sample session log', { skip }, async ()
 
   // --- determinism: recompiling the same span right now answers identically ---
   for (const run of runs) {
-    const { text: again } = buildCheckpoint(run.session, span.start, span.end, {
+    const { text: again } = Compiler.buildCheckpoint(run.session, span.start, span.end, {
       thoughtChars: run.thoughtChars,
       refLineFormat: run.format,
     });
@@ -740,7 +740,7 @@ test('refLineFormat e2e on the committed sample session log', { skip }, async ()
 
   // --- pins stay untouched (this e2e pins nothing) ----------------------------
   for (const run of runs) {
-    assert.deepEqual([...pinsFor(run.session)], [], 'the pinned map stays empty when nothing was recalled');
+    assert.deepEqual([...Pins.pinsFor(run.session)], [], 'the pinned map stays empty when nothing was recalled');
   }
 
   // --- the blocks the window must NEVER lose ----------------------------------
@@ -749,12 +749,12 @@ test('refLineFormat e2e on the committed sample session log', { skip }, async ()
   // context and skill catalog survive even when their injection lies OUTSIDE the
   // compacted range (then the compiler carries the newest copy back). Both are
   // judged on the real log, off the INPUT events — not off the printed body.
-  const spanHumans = humanTurns(runs[0].session, (seq) => seq >= span.start && seq <= span.end);
+  const spanHumans = Compiler.humanTurns(runs[0].session, (seq) => seq >= span.start && seq <= span.end);
   // Human turns an EARLIER compaction already shadowed are no less requests: the
   // pin block must name them too (clipped to retainLength, restorable by recall).
   // Turns older than this span but never shadowed are still in the live window, so
   // re-pinning them here would duplicate a message — they stay out of the count.
-  const olderHumans = shadowedHumanEntries(runs[0].session, span.start);
+  const olderHumans = Compiler.shadowedHumanEntries(runs[0].session, span.start);
   const expectedPins = [...new Set([...olderHumans.map((entry) => entry.seq), ...spanHumans.map((entry) => entry.seq)])];
   console.log(`pin block source: ${spanHumans.length} human turns inside the span + ${olderHumans.length} shadowed by earlier compactions (oldest seq ${olderHumans.length ? olderHumans[0].seq : '-'}) — expected pin seqs: ${expectedPins.join(',')}`);
   const kindsInLog = new Set();
@@ -897,7 +897,7 @@ test('refLineFormat e2e on the committed sample session log', { skip }, async ()
     { label: 'budget-64k-window', windowTokens: CONTEXT_WINDOW_TOKENS, ratio: CONTEXT_MAX_RATIO },
     { label: 'budget-unlimited', windowTokens: 10_000_000, ratio: 1 },
   ]) {
-    const compiled = buildCheckpoint(runs[0].session, span.start, span.end, {
+    const compiled = Compiler.buildCheckpoint(runs[0].session, span.start, span.end, {
       thoughtChars: 200,
       refLineFormat: 'thought',
       retainLength: DEFAULT_RETAIN_LENGTH,
@@ -983,7 +983,7 @@ test('cross-span index safety and the pin block on a real window with human turn
   assert.ok(cpSeqs.length >= 2, 'the log holds at least two checkpoints, so one window can open with an earlier one');
 
   // Cut after the LAST human turn that still sits before the next own checkpoint.
-  const humans = userMessages(events);
+  const humans = Compiler.userMessages(events);
   const windows = [];
   for (let i = 0; i + 1 < cpSeqs.length; i += 1) {
     const between = humans.filter((entry) => entry.seq > cpSeqs[i] && entry.seq < cpSeqs[i + 1]);
@@ -1007,7 +1007,7 @@ test('cross-span index safety and the pin block on a real window with human turn
     .map((event) => ({ seq: event.seq, ourHeader: OWN_REF_HEADER_LINE.test(textOf(event.data)) }));
   const oursHere = cps.filter((entry) => entry.ourHeader);
   console.log(`diag: span=${span.start}-${span.end} cps=${JSON.stringify(cps)} ofOurs=${oursHere.length}`);
-  const units = carriedReferences(truncated.filter((event) => event.seq >= span.start && event.seq <= span.end));
+  const units = Compiler.carriedReferences(truncated.filter((event) => event.seq >= span.start && event.seq <= span.end));
   if (oursHere.length === 0) {
     // The prior checkpoints in this stretch were written by ANOTHER backend — an
     // LLM summary whose prose happens to name our headings. Nothing of our line
@@ -1024,9 +1024,9 @@ test('cross-span index safety and the pin block on a real window with human turn
 
   // Pin block: one line per human turn of the WHOLE session — the span's own turns
   // plus every turn an earlier compaction already shadowed, re-read off the log.
-  const humansInSpan = humanTurns(out.session, (seq) => seq >= span.start && seq <= span.end);
+  const humansInSpan = Compiler.humanTurns(out.session, (seq) => seq >= span.start && seq <= span.end);
   assert.ok(humansInSpan.length >= 1, 'this window really holds human turns, so the pin block has something to keep');
-  const olderHumansCum = shadowedHumanEntries(out.session, span.start);
+  const olderHumansCum = Compiler.shadowedHumanEntries(out.session, span.start);
   const expectedPinsCum = [...new Set([...humansInSpan.map((entry) => entry.seq), ...olderHumansCum.map((entry) => entry.seq)])];
   const pinnedLines = pinLines(text);
   assert.equal(pinnedLines.length, expectedPinsCum.length,
@@ -1043,7 +1043,7 @@ test('cross-span index safety and the pin block on a real window with human turn
       `retainLength ${DEFAULT_RETAIN_LENGTH}: a pinned clip is longer (${clip[2]})`);
   }
 
-  const { stats } = buildCheckpoint(out.session, span.start, span.end, { thoughtChars: 200, refLineFormat: 'thought' });
+  const { stats } = Compiler.buildCheckpoint(out.session, span.start, span.end, { thoughtChars: 200, refLineFormat: 'thought' });
   const section = ownSection(text);
   assert.ok(section !== null, 'the run emitted its own reference section');
   const bodyNumbers = new Set(section.refLines.flatMap((line) => pointersOfLine(line).numbers));
@@ -1054,7 +1054,7 @@ test('cross-span index safety and the pin block on a real window with human turn
   // the host-owned `compaction/summary` brackets name every seq range an earlier
   // compaction shadowed, and the append-only log still holds those calls. So a
   // checkpoint some OTHER backend wrote no longer limits what this session indexes.
-  const logUnits = shadowedCallEntries(out.session, span.start);
+  const logUnits = Compiler.shadowedCallEntries(out.session, span.start);
   assert.ok(logUnits.every((entry) => entry.call.seq < span.start), 'the log source names only traffic OLDER than the span being compacted');
   const distinctLog = new Set(logUnits.map((entry) => entry.call.seq));
   assert.equal(distinctLog.size, logUnits.length, 'a call inside two overlapping shadow ranges is still indexed once');

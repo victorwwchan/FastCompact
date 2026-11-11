@@ -1,6 +1,6 @@
 {
   "name": "dsh-fast-compact",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Deterministic zero-LLM compaction engine for DeepSeek Harness: dropped tool traffic becomes session-log seq reference lines.",
   "type": "module",
   "files": [

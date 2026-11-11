@@ -38,10 +38,10 @@
  * @module dsh-fast-compact
  */
 
-import { loadRuntime, TESTED_DSH_VERSIONS } from './lib/runtime.mjs';
-import { createEngineClass, ENGINE_PROVIDER, ENGINE_MODEL, LOG_PREFIX } from './lib/engine.mjs';
-import { resolveFastCompactConfig, splitRowConfig, FASTCOMPACT_KEYS, HOST_COMPACT_KEYS, deriveRoutePressure, HEADROOM_RATIO, HEADROOM_FALLBACK_TOKENS } from './lib/config.mjs';
-import { defineRecallTools, registerCommands, DEFAULT_TOOL_NAMES } from './lib/tools.mjs';
+import { Runtime, TESTED_DSH_VERSIONS } from './lib/runtime.mjs';
+import { Engine, ENGINE_PROVIDER, ENGINE_MODEL, LOG_PREFIX } from './lib/engine.mjs';
+import { Config, FASTCOMPACT_KEYS, HOST_COMPACT_KEYS, HEADROOM_RATIO, HEADROOM_FALLBACK_TOKENS } from './lib/config.mjs';
+import { Tools, DEFAULT_TOOL_NAMES } from './lib/tools.mjs';
 
 export const name = 'dsh-fast-compact';
 export const inject = ['tokenMeter', 'sessions', 'llm'];
@@ -52,6 +52,31 @@ const PLUGIN_KEYS = ['harnessEntry', 'allowUntestedHarness', 'recallToolName', '
 /** Default recall budgets; a row may raise or lower either one. */
 const DEFAULT_MAX_RECALL_CHARS = 60_000;
 const DEFAULT_MAX_SEARCH_HITS = 40;
+
+/**
+ * The plugin's OWN instruction — separate from the compiler's SESSION_LOG_INSTRUCTION,
+ * which rides once at each compaction point inside the checkpoint. This text is the
+ * per-step copy: the mount re-injects it as a user-role message before EVERY agent
+ * step (the ctx.on('agent/pre-step') listener below), so the ruleset always sits at
+ * the live end of the window and never decays as history grows behind it — the
+ * pattern that keeps skill reminders followed. A `source.kind` of its own marks the
+ * copies: the compiler ignores unknown kinds, so older injections fold OUT at the
+ * next compaction (never pinned, never carried), and the fresh step copy replaces
+ * them. `${recallTool}` / `${searchTool}` interpolate to the row's actual tool names.
+ */
+export const PLUGIN_INSTRUCTION_SOURCE_KIND = 'fastcompact-instruction';
+export const PLUGIN_INSTRUCTION = [
+  'dsh-fast-compact is active — every reply AND every thinking/reasoning block MUST open with within ~100 words summary as a index.',
+  '\t1. Planning: write the plan into ./plan/${Subject}-Plan.md and tick its items as work moves.',
+  '\t2. Past content — older tool output, earlier reasoning, anything cut from this window — lives ONLY in the session log. Reach it with OUR tools: ${searchTool} finds the FULL log (search BEFORE calling other tools), ${recallTool} {"seq":N} / {"result":N} / {"range":"A-B"} restores exact content. Never grep, read, or hunt logs/files yourself for past content, and never guess what was cut.',
+].join('\n');
+
+/** Resolve the placeholders against the names this mount actually registers. */
+export function renderPluginInstruction(names) {
+  return PLUGIN_INSTRUCTION
+    .replaceAll('${recallTool}', names.recall)
+    .replaceAll('${searchTool}', names.search);
+}
 
 function toolName(value, fallback, key) {
   if (value === undefined) return fallback;
@@ -167,7 +192,7 @@ async function resolveHeadroomTable(ctx, row, headroomRatio) {
       }
       const ratio = ratios.get(`${providerId}/${modelId}`) ?? rowRatio;
       try {
-        const pressure = deriveRoutePressure(contextWindow, ratio, info.defaultMaxTokens ?? 0, headroomRatio);
+        const pressure = Config.deriveRoutePressure(contextWindow, ratio, info.defaultMaxTokens ?? 0, headroomRatio);
         perRoute.push({
           provider: providerId,
           model: modelId,
@@ -195,7 +220,7 @@ async function resolveHeadroomTable(ctx, row, headroomRatio) {
   // window (O = 0 there, so nothing is invented for an unnamed route's output default).
   const tightest = windows.reduce((min, window) => Math.min(min, window), Number.MAX_SAFE_INTEGER);
   if (windows.length === 0) return { topLevel: HEADROOM_FALLBACK_TOKENS, topLevelThresholdRatio: null, topLevelOutputCap: null, perRoute };
-  const topPressure = deriveRoutePressure(tightest, rowRatio, 0, headroomRatio);
+  const topPressure = Config.deriveRoutePressure(tightest, rowRatio, 0, headroomRatio);
   return {
     topLevel: topPressure.headroomTokens,
     topLevelThresholdRatio: topPressure.thresholdRatio,
@@ -227,7 +252,7 @@ export async function apply(ctx, config = {}) {
     if (PLUGIN_KEYS.includes(key)) plugin[key] = value;
     else engineRow[key] = value;
   }
-  const resolvedConfig = resolveFastCompactConfig(engineRow);
+  const resolvedConfig = Config.resolveFastCompactConfig(engineRow);
 
   const names = {
     recall: toolName(plugin.recallToolName, DEFAULT_TOOL_NAMES.recall, 'recallToolName'),
@@ -242,12 +267,12 @@ export async function apply(ctx, config = {}) {
   // Load the harness classes from the running dsh install; its own version gate
   // and API contract check run here.
   const allowUntested = plugin.allowUntestedHarness === true;
-  const runtime = await loadRuntime(plugin.harnessEntry, { allowUntested });
+  const runtime = await Runtime.loadRuntime(plugin.harnessEntry, { allowUntested });
   if (runtime.versionStatus !== 'tested') {
     ctx.logger.warn(`${LOG_PREFIX} dsh ${runtime.version ?? '(unknown version)'} has not been tested with this plugin (tested: ${TESTED_DSH_VERSIONS.join(', ')}); the API contract check passed, loading anyway`);
   }
 
-  const Engine = createEngineClass(runtime);
+  const fastEngine = Engine.createEngineClass(runtime);
 
   // Derive the base's absolute headroom from every route's own window. A fixed
   // token count in the row only fits one model size: sized for a huge window it
@@ -264,18 +289,63 @@ export async function apply(ctx, config = {}) {
   // engine so reference lines can name the tool that restores a seq, and the
   // derived table reaches it as `derivedHeadroom`, which its constructor merges
   // into the host half before it rides to the base.
-  ctx.plugin(Engine, { ...engineRow, derivedHeadroom: headroomTable, toolNames: names });
+  ctx.plugin(fastEngine, { ...engineRow, derivedHeadroom: headroomTable, toolNames: names });
 
   ctx.inject(['tools'], (toolCtx) => {
-    for (const definition of defineRecallTools(runtime, budgets, names)) {
+    for (const definition of Tools.defineRecallTools(runtime, budgets, names)) {
       toolCtx.effect(() => toolCtx.tools.register(definition), `${name} ${definition.name} tool`);
     }
+  });
+
+  // The plugin's OWN instruction still rides at the live end of the window (the same
+  // middleware point dsh-plan-mode and dsh-tool-skill use from inside an isolate
+  // realm), but it is NOT re-injected before every step any more — that rule spent
+  // the same text dozens of times across one session, and every copy costs its own
+  // window share while the checkpoint's stats read inflated because of it. The
+  // default (`pluginInstructionInject: 'once'`) spends the copy ONCE per surface
+  // generation: it stays live until a compaction replaces the surface, and only that
+  // replacement re-arms the mount — one copy per compaction cycle instead of one per
+  // step. `'pressure'` is stricter still: the copy also waits until the route's own
+  // pressure gate says compaction is due (the same `surfaceTokens >= gateTokens`
+  // comparison `compactIfNeeded` makes), which matches "inject only when we are about
+  // to compact"; it keeps the per-generation guard, so an above-gate session that the
+  // base has not compacted yet cannot stack copies. `'step'` restores the old every-step
+  // rule for anyone who wants the instruction re-read each turn. A route whose gate
+  // nobody can name leaves `'pressure'` to the `'once'` rule — inventing a gate would
+  // arm at a point nothing governs.
+  const pluginInstructionText = renderPluginInstruction(names);
+  const pluginInjectMode = resolvedConfig.pluginInstructionInject;
+  // The surface generation this mount last delivered a copy for; a compaction bumps
+  // `replaceGeneration`, and that bump — not the step count — is what re-arms us.
+  let pluginInjectedGeneration = null;
+  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next();
+    if (decision.kind === 'reject') return decision;
+    signal?.throwIfAborted();
+    if (pluginInjectMode !== 'step') {
+      // No agent in the payload means no surface to arm against: deliver the copy
+      // without recording a generation, so the next step re-checks honestly.
+      const generation = agent?.session?.surface?.replaceGeneration;
+      if (pluginInjectedGeneration === generation) return decision;
+      if (pluginInjectMode === 'pressure') {
+        const engine = ctx.compaction;
+        // No engine handle or no readable gate: leave the copy to the once-per-generation
+        // rule rather than arming at a point nothing governs.
+        if (typeof engine?.pressureDue === 'function' && !await engine.pressureDue(agent)) return decision;
+      }
+      if (typeof generation === 'number') pluginInjectedGeneration = generation;
+    }
+    const injection = runtime.createUserMessage({
+      content: [{ type: 'text', text: `<system-reminder>\n${pluginInstructionText}\n</system-reminder>` }],
+      source: { kind: PLUGIN_INSTRUCTION_SOURCE_KIND },
+    });
+    return { ...decision, messages: [...decision.messages, injection] };
   });
 
   // Needs the engine (ctx.compaction) this row provides and the command registry.
   ctx.inject(['commands', 'compaction'], (commandCtx) => {
     const warn = (message) => commandCtx.logger.warn(`${LOG_PREFIX} ${message}; continuing without it`);
-    commandCtx.effect(() => registerCommands(commandCtx, budgets, warn), `${name} commands`);
+    commandCtx.effect(() => Tools.registerCommands(commandCtx, budgets, warn), `${name} commands`);
   });
 
   // Mount log states the ACTUAL gate each route now fires at, as a share of the RAW
@@ -320,6 +390,7 @@ export async function apply(ctx, config = {}) {
     `${LOG_PREFIX} loaded on dsh ${runtime.version ?? '(unknown version)'}; `
     + `engine ${ENGINE_PROVIDER}/${ENGINE_MODEL}, refLineFormat ${resolvedConfig.refLineFormat}, thoughtChars ${resolvedConfig.thoughtChars}, retainLength ${resolvedConfig.retainLength}, contextMaxRatio ${resolvedConfig.contextMaxRatio}, `
     + `debug ${resolvedConfig.debug ? 'on' : 'off'}, instructions ${resolvedConfig.instructions === '' ? 'off' : 'on'}`
-    + `; tools ${names.recall}, ${names.search}; commands /recall, /fastcompact; ${headroomSummary}`,
+    + `; tools ${names.recall}, ${names.search}; commands /recall, /fastcompact; plugin instruction injected ${pluginInjectMode === 'step' ? 'every step' : pluginInjectMode === 'pressure' ? 'once per surface generation, only while the route pressure gate is due' : 'once per surface generation'} (source kind ${PLUGIN_INSTRUCTION_SOURCE_KIND})`
+    + `; ${headroomSummary}`,
   );
 }

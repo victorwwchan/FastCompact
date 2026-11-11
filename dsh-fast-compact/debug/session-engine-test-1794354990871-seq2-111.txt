@@ -1,3 +1,13 @@
+</compacted-summary>
+
+<system prompt>
+### Instructions to work with a dsh-fast-compact generated context window:
+	STRICT RULE — 1. every reply you write in this window MUST begin with one line (~200 words): first summarize the previous actions/results, then state what you will do next. Keep that line current as the work evolves so the NEXT compaction carries your latest state — a reply without it breaks the chain.
+	2. When you start to plan, output it into a Plan.md too and update progress items afterwards. 3. If you find some information missed pls use recall_search to do a log search first before you actually calling tools.
+	Anything under a reference line — tool output, older reasoning, cut passages — lives only in the session log. Restore it with recall {"seq":N} / {"result":N} / {"range":"A-B"}, or find it first with recall_search; do this BEFORE you rely on content you cannot see, and never guess at it.
+</system prompt>
+
+<compacted-summary>
 ## Pinned content (every user message kept, plus recalled entries verbatim)
 - [user seq 2] "Turn 1: please work on task 1." — restore with recall {"seq": 2}
 - [user seq 21] "Turn 2: please work on task 2." — restore with recall {"seq": 21}
@@ -18,8 +28,8 @@
 thinking deeply about turn 6 step 3
 [/agent thought seq 109]
 ## Context window stats (this compaction)
-- usage before compact: 29.7% of the window, after compact: 1.6% (gate 90.0% — past the 33,535-token message budget: the messages can never reach it, so pressure does not trip and compaction rides the provider's rejection, freed 18,401 tokens)
-- debug dump: C:\Users\vic\.dsh\fast-compact\debug\session-engine-test-1793561085215-seq2-111.txt
+- usage before compact: 29.7% of the window, after compact: 1.6% (gate 47.2% of the window (the row wanted 90.0% of the window; its messages top out at 47.2%, so it fires there) — a share past what the messages can hold, so pressure here runs on borrowed time, freed 18,433 tokens)
+- debug dump: C:\Users\vic\.dsh\fast-compact\dsh-fast-compact\debug\session-engine-test-1794354990871-seq2-111.txt
 ## Session-log references (dropped tool traffic): seq 5–111
 Restore any original with recall {"seq": N} — several seqs in ONE range request ("a-b"). Need content not visible here? It is still in the FULL session log: call recall_search for it first, then restore the seqs it reports.
 - [thinking deeply about turn 1 step 1] (thought seq 4) → seq 5, result seq 6, 4.0 KB
@@ -40,13 +50,3 @@ Restore any original with recall {"seq": N} — several seqs in ONE range reques
 - [thinking deeply about turn 6 step 1] (thought seq 99) → seq 100, result seq 101, 4.0 KB
 - [thinking deeply about turn 6 step 2] (thought seq 104) → seq 105, result seq 106, 4.0 KB
 - [thinking deeply about turn 6 step 3] (thought seq 109) → seq 110, result seq 111, 4.0 KB
-## Session-log instruction
-### Instructions to work with a dsh-fast-compact generated context window:
-	This context was extracted from current chat session logs by dsh-fast-compact plugin:
-	We will take first 200 thinking text into context window (see the last agent thought block).
-	To make it useable and effective to preserve your idea in next context window, pls follow below output format(Must with ✓ on 1st line to indicate you remember this instruction):
-	✓ [1st line: summarize previous actions/results in ~100 words, then state what you will do next in ~100 words]
-		details that only matter on demand stay in the session log and are retrievable with recall
-	(Tool calls and your own thinking now are not carried into the next window — write them freely, keep the two lines above current.)
-	Anything under a reference line — tool output, older reasoning, cut passages — lives only in the session log.
-	Restore it with recall {"seq":N} / {"result":N} / {"range":"A-B"}, or find it first with recall_search; do this BEFORE you rely on content you cannot see, and never guess at it.

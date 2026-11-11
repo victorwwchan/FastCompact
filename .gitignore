@@ -8,6 +8,9 @@ compaction-log.json
 /*.txt
 /*.mjs
 /*.bak
+dsh-fast-compact/scratch/
+dsh-fast-compact/debug/
+*Plan.md
 
 .usage.json
 .usage.json.lock

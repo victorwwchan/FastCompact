@@ -14,30 +14,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { buildEvents } from './helpers.mjs';
-import {
-  CONTEXT_KINDS,
-  PINNED_OPEN,
-  STATE_OPEN,
-  REFERENCES_HEADING,
-  INSTRUCTION_HEADING,
-  DEBUG_HEADING,
-  STATS_HEADING,
-  SESSION_LOG_INSTRUCTION,
-  contextBlocks,
-  carriedContext,
-  carriedReferences,
-  shadowedCallEntries,
-  shadowedHumanEntries,
-  humanTurns,
-  userMessages,
-  pinnedBlock,
-  stateBlock,
-  thoughtBlock,
-  referenceBlock,
-  buildCheckpoint,
-  contextStatsBlock,
-} from '../lib/compiler.mjs';
-import { pin, pinsFor } from '../lib/pins.mjs';
+import { Compiler, CONTEXT_KINDS, PINNED_OPEN, STATE_OPEN, REFERENCES_HEADING, SYSTEM_PROMPT_OPEN, DEBUG_HEADING, STATS_HEADING, SESSION_LOG_INSTRUCTION } from '../lib/compiler.mjs';
+import { Pins } from '../lib/pins.mjs';
 import { REFERENCES_BLOCK_BYTES } from '../lib/config.mjs';
 
 const OPTIONS = { thoughtChars: 200, refLineFormat: 'thought', toolNames: { recall: 'recall', search: 'recall_search' } };
@@ -67,7 +45,7 @@ function contextEvents() {
 }
 
 test('compiler: contextBlocks keeps one newest copy per kind in CONTEXT_KINDS order', () => {
-  const blocks = contextBlocks(contextEvents());
+  const blocks = Compiler.contextBlocks(contextEvents());
   assert.deepEqual(blocks.map((entry) => entry.kind), ['runtime-context', 'skill-catalog'], 'order follows CONTEXT_KINDS');
   assert.equal(blocks[0].text, 'DUP words', 'the newest copy wins');
   assert.ok(!blocks.some((entry) => entry.text === 'OLD runtime words'), 'the superseded copy is gone');
@@ -75,7 +53,7 @@ test('compiler: contextBlocks keeps one newest copy per kind in CONTEXT_KINDS or
 });
 
 test('compiler: contextBlocks ignores every other message source', () => {
-  assert.deepEqual(contextBlocks(buildEvents({ turns: 2, callsPerTurn: 1 })), [], 'a plain session emits no context blocks');
+  assert.deepEqual(Compiler.contextBlocks(buildEvents({ turns: 2, callsPerTurn: 1 })), [], 'a plain session emits no context blocks');
 });
 
 /** Re-number a flat event list so array index == seq (fakeSession's lookup). */
@@ -94,12 +72,12 @@ test('compiler: carriedContext brings back a context kind the span does not hold
   const session = fakeSession(all);
   const start = injections.length;
 
-  assert.deepEqual(carriedContext(session, start, CONTEXT_KINDS, []), [
+  assert.deepEqual(Compiler.carriedContext(session, start, CONTEXT_KINDS, []), [
     { kind: 'runtime-context', seq: 0, text: 'OLD runtime words' },
     { kind: 'skill-catalog', seq: 1, text: '<available_skills>one skill</available_skills>' },
   ], 'both kinds come from before the span');
 
-  const { text, stats } = buildCheckpoint(session, start, all.length - 1, OPTIONS);
+  const { text, stats } = Compiler.buildCheckpoint(session, start, all.length - 1, OPTIONS);
   assert.ok(text.includes('[runtime-context seq 0]\nOLD runtime words'), 'the runtime block is back in the resumed window');
   assert.ok(text.includes('[skill-catalog seq 1]'), 'and so is the skill catalog');
   assert.deepEqual(stats.contextBlocks, [], 'the span itself held neither kind');
@@ -112,7 +90,7 @@ test('compiler: carriedContext reads an older copy folded inside a previous chec
     data: { role: 'user', content: [{ type: 'text', text: '## State of work\n[runtime-context seq 3]\nOLD runtime words\n[/runtime-context seq 3]\n- files written: none' }], source: { kind: 'compact-checkpoint' }, id: 'cp' },
   };
   const all = renumber([folded, ...buildEvents({ turns: 2, callsPerTurn: 1 })]);
-  const carried = carriedContext(fakeSession(all), 1, CONTEXT_KINDS, []);
+  const carried = Compiler.carriedContext(fakeSession(all), 1, CONTEXT_KINDS, []);
   assert.equal(carried.length, 1, 'only the runtime kind is mentioned in that text');
   assert.equal(carried[0].kind, 'runtime-context', 'the folded copy is found');
   assert.equal(carried[0].text, 'OLD runtime words', 'its body is carried without the wrapper');
@@ -120,7 +98,7 @@ test('compiler: carriedContext reads an older copy folded inside a previous chec
 
 test('compiler: userMessages names every human turn and skips injected context', () => {
   const events = buildEvents({ turns: 2, callsPerTurn: 1 });
-  const humans = userMessages([...events, injection('runtime-context', 'ignored words'), injection('time-context', 'also ignored')]);
+  const humans = Compiler.userMessages([...events, injection('runtime-context', 'ignored words'), injection('time-context', 'also ignored')]);
   assert.deepEqual(humans.map((entry) => entry.seq), events.filter((event) => event.type === 'user/message').map((event) => event.seq), 'one entry per human turn');
   assert.ok(!humans.some((entry) => entry.text.includes('ignored words')), 'injected context is not a request');
 });
@@ -131,7 +109,7 @@ test('compiler: pinnedBlock carries every user message in the span, clipped to r
     type: 'user/message', seq: events.length, time: 1_700_000_000_999,
     data: { role: 'user', content: [{ type: 'text', text: 'Please keep the whole request intact even though it is long: ' + 'tail words'.repeat(40) }], source: { kind: 'user' }, id: 'u-long' },
   };
-  const block = pinnedBlock([...events, longUser], new Set(), 60);
+  const block = Compiler.pinnedBlock([...events, longUser], new Set(), 60);
   assert.ok(block.startsWith(PINNED_OPEN), 'heading first');
   for (const event of events) {
     if (event.type !== 'user/message') continue;
@@ -146,8 +124,8 @@ test('compiler: pinnedBlock keeps a recalled entry verbatim above its pointer li
   const events = buildEvents({ turns: 2, callsPerTurn: 0 });
   const session = fakeSession(events);
   const firstUserSeq = events.find((event) => event.type === 'user/message').seq;
-  pin(session, [firstUserSeq]);
-  const block = pinnedBlock(events, pinsFor(session), 200);
+  Pins.pin(session, [firstUserSeq]);
+  const block = Compiler.pinnedBlock(events, Pins.pinsFor(session), 200);
   assert.ok(block.startsWith(PINNED_OPEN), 'heading first');
   assert.ok(block.includes(`[pinned seq ${firstUserSeq}]`), 'the recalled entry names its seq');
   assert.ok(block.includes('please work on task 1'), 'its words are carried, not summarized');
@@ -157,30 +135,30 @@ test('compiler: pinnedBlock keeps a recalled entry verbatim above its pointer li
 
 test('compiler: pinnedBlock only disappears when there is no human text to keep', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 2 });
-  assert.notEqual(pinnedBlock(events, pinsFor(fakeSession(events))), '', 'the human turn still earns a block');
+  assert.notEqual(Compiler.pinnedBlock(events, Pins.pinsFor(fakeSession(events))), '', 'the human turn still earns a block');
   const contextOnly = [buildEvents({ turns: 0, callsPerTurn: 0 })[0]];
-  assert.equal(pinnedBlock(contextOnly, pinsFor(fakeSession(contextOnly))), '', 'no user message and no pins = no heading');
+  assert.equal(Compiler.pinnedBlock(contextOnly, Pins.pinsFor(fakeSession(contextOnly))), '', 'no user message and no pins = no heading');
 });
 
 test('compiler: stateBlock names the last human request verbatim-quoted', () => {
   const events = buildEvents({ turns: 2, callsPerTurn: 0 });
-  const block = stateBlock(events, 200);
+  const block = Compiler.stateBlock(events, 200);
   assert.ok(block.startsWith(STATE_OPEN), 'heading first');
   const lastUser = events.filter((event) => event.type === 'user/message').at(-1);
   assert.ok(block.includes(`- last user request in this span: seq ${lastUser.seq} — "Turn 2: please work on task 2."`), 'newest human turn, JSON-quoted');
 
   const longRequest = renumber([...events, injection('user', `Please keep the last request readable: ${'tail words'.repeat(40)}`)]);
-  const clipped = stateBlock(longRequest, 200, 40);
+  const clipped = Compiler.stateBlock(longRequest, 200, 40);
   assert.ok(clipped.includes('- last user request in this span:'), 'the newest request is still named');
   assert.ok(!clipped.includes('tail words tail words tail words tail words tail words'), 'retainLength caps it');
 
   const injectedOnly = renumber(events.filter((event) => event.type !== 'user/message' || event.data?.source?.kind !== 'user'));
-  assert.ok(!stateBlock(injectedOnly, 200).includes('last user request'), 'injected context never poses as a request');
+  assert.ok(!Compiler.stateBlock(injectedOnly, 200).includes('last user request'), 'injected context never poses as a request');
 });
 
 test('compiler: stateBlock replays files written and commands run with their seqs', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 2 });
-  const block = stateBlock(events, 200);
+  const block = Compiler.stateBlock(events, 200);
   const writeSeq = events.find((event) => event.type === 'tool/call' && event.data.name === 'write').seq;
   const bashSeq = events.find((event) => event.type === 'tool/call' && event.data.name === 'bash').seq;
   assert.ok(block.includes('- files written in this span (1):'), 'one write fact');
@@ -193,23 +171,23 @@ test('compiler: stateBlock marks an unresolved error with both of its seqs', () 
   const resultEvent = events.find((event) => event.type === 'tool/result');
   resultEvent.data.message.isError = true;
   const callSeq = events.find((event) => event.type === 'tool/call').seq;
-  assert.ok(stateBlock(events, 200).includes(`- unresolved error: write (call seq ${callSeq}, result seq ${resultEvent.seq})`), 'both seqs so the model can retry');
+  assert.ok(Compiler.stateBlock(events, 200).includes(`- unresolved error: write (call seq ${callSeq}, result seq ${resultEvent.seq})`), 'both seqs so the model can retry');
 });
 
 test('compiler: stateBlock hands the last thought back before it is quoted', () => {
-  const block = stateBlock(buildEvents({ turns: 1, callsPerTurn: 1 }), 200);
+  const block = Compiler.stateBlock(buildEvents({ turns: 1, callsPerTurn: 1 }), 200);
   assert.ok(block.endsWith('- last agent thought kept verbatim below; continue from its own words, do not re-derive it.'), 'pointer line closes the block');
 });
 
 test('compiler: stateBlock emits nothing when the span carries no facts', () => {
   const events = [{ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }];
-  assert.equal(stateBlock(events, 200), '', 'a bare span contributes no block');
+  assert.equal(Compiler.stateBlock(events, 200), '', 'a bare span contributes no block');
 });
 
 test('compiler: thoughtBlock quotes the newest reasoning and names its seq both ways', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 1 });
   const assistantSeq = events.find((event) => event.type === 'assistant/message').seq;
-  const { block, thoughtSeq } = thoughtBlock(events, 40);
+  const { block, thoughtSeq } = Compiler.thoughtBlock(events, 40);
   assert.equal(thoughtSeq, assistantSeq, 'the pointer is the reasoning event');
   assert.ok(block.startsWith(`[agent thought seq ${assistantSeq}]`), 'open tag names the seq');
   assert.ok(block.endsWith(`[/agent thought seq ${assistantSeq}]`), 'close tag mirrors it');
@@ -219,19 +197,19 @@ test('compiler: thoughtBlock quotes the newest reasoning and names its seq both 
 test('compiler: thoughtChars 0 keeps only the recall pointer for the thought', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 1 });
   const assistantSeq = events.find((event) => event.type === 'assistant/message').seq;
-  const { block, thoughtSeq } = thoughtBlock(events, 0);
+  const { block, thoughtSeq } = Compiler.thoughtBlock(events, 0);
   assert.equal(thoughtSeq, assistantSeq, 'the seq is still known');
   assert.equal(block, `- last agent thought not quoted; resume from its own words with recall {"seq": ${assistantSeq}}, do not re-derive`, 'pointer line only');
 });
 
 test('compiler: a span with no reasoning carries no thought block', () => {
   const events = [{ type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }];
-  assert.deepEqual([thoughtBlock(events, 200)], [{ block: '', thoughtSeq: undefined }], 'nothing to quote');
+  assert.deepEqual([Compiler.thoughtBlock(events, 200)], [{ block: '', thoughtSeq: undefined }], 'nothing to quote');
 });
 
 test('compiler: referenceBlock labels its section with the span it covers', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 1 });
-  const { block, refs, dropped } = referenceBlock(events, OPTIONS);
+  const { block, refs, dropped } = Compiler.referenceBlock(events, OPTIONS);
   assert.equal(refs, 1, 'one line per dropped call');
   assert.equal(dropped, 0, 'one call never folds');
   const firstCall = events.find((event) => event.type === 'tool/call').seq;
@@ -242,14 +220,14 @@ test('compiler: referenceBlock labels its section with the span it covers', () =
 
 test('compiler: referenceBlock labels each line with the thought that drove it', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 2 });
-  const { block } = referenceBlock(events, OPTIONS);
+  const { block } = Compiler.referenceBlock(events, OPTIONS);
   assert.ok(block.includes('[thinking deeply about turn 1 step 1]'), 'first line quotes its own thought');
   assert.ok(block.includes('[thinking deeply about turn 1 step 2]'), 'a different governing thought is quoted again');
 });
 
 test('compiler: refLineFormat none drops thought labels entirely', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 1 });
-  const { block } = referenceBlock(events, { ...OPTIONS, refLineFormat: 'none' });
+  const { block } = Compiler.referenceBlock(events, { ...OPTIONS, refLineFormat: 'none' });
   assert.ok(!block.includes('(thought seq'), 'no thought label at all');
   assert.ok(block.includes('- write src/file_1_1.js →'), 'labelled by the tool and its key argument');
 });
@@ -270,16 +248,16 @@ test('compiler: the reference index accumulates across spans instead of restarti
   // replaced it is. So the two older calls can only be re-named through the
   // carried section, which is exactly what a resumed model needs to `recall` them.
   const older = buildEvents({ turns: 2, callsPerTurn: 1 });
-  const prior = buildCheckpoint(fakeSession(older), 0, older.length - 1, OPTIONS).text;
+  const prior = Compiler.buildCheckpoint(fakeSession(older), 0, older.length - 1, OPTIONS).text;
   const newer = buildEvents({ turns: 1, callsPerTurn: 1 });
   const all = renumber([...pad(older.length + 2), checkpointMessage(prior), ...newer]);
 
-  const carriedUnits = carriedReferences(all);
+  const carriedUnits = Compiler.carriedReferences(all);
   assert.equal(carriedUnits.length, 2, 'both reference lines the previous compaction published are read back');
   assert.ok(carriedUnits[0].callSeq < carriedUnits[1].callSeq, 'oldest first');
   assert.ok(carriedUnits.every((entry) => entry.count === 1), 'a plain line indexes exactly one call');
 
-  const { block, refs, dropped, carried } = referenceBlock(all, OPTIONS, [], carriedUnits);
+  const { block, refs, dropped, carried } = Compiler.referenceBlock(all, OPTIONS, [], carriedUnits);
   assert.equal(carried, 2, 'referenceBlock reports what it carried');
   assert.ok(block.includes(carriedUnits[0].line) && block.includes(carriedUnits[1].line),
     'the older spans keep their lines verbatim');
@@ -295,8 +273,8 @@ test('compiler: the reference index accumulates across spans instead of restarti
 test('compiler: a foreign checkpoint contributes nothing to the index', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 1 });
   const all = renumber([...pad(4), checkpointMessage('## Some other summary\n- it indexed nothing of our shape'), ...events]);
-  assert.deepEqual(carriedReferences(all), [], 'lines that match neither of our two shapes are not ours to re-index');
-  const { block, carried } = referenceBlock(all, OPTIONS, [], carriedReferences(all));
+  assert.deepEqual(Compiler.carriedReferences(all), [], 'lines that match neither of our two shapes are not ours to re-index');
+  const { block, carried } = Compiler.referenceBlock(all, OPTIONS, [], Compiler.carriedReferences(all));
   assert.equal(carried, 0, 'nothing was carried');
   const ownCall = all.find((event) => event.type === 'tool/call').seq;
   const ownResult = all.filter((event) => event.type === 'tool/result').at(-1).seq;
@@ -320,13 +298,13 @@ test('compiler: the index names older traffic straight from the log, whatever wr
   ]);
   const start = first.length + 2; // where `second` begins
   const span = all.slice(start);
-  const older = shadowedCallEntries(fakeSession(all), start);
+  const older = Compiler.shadowedCallEntries(fakeSession(all), start);
   const firstCalls = first.filter((event) => event.type === 'tool/call').map((event) => event.seq);
 
   assert.equal(older.length, firstCalls.length, 'every shadowed call is read back out of the log');
   assert.deepEqual(older.map((entry) => entry.call.seq), firstCalls, 'oldest first, at the seqs the log holds them at');
 
-  const { block, refs, carried } = referenceBlock(span, OPTIONS, older);
+  const { block, refs, carried } = Compiler.referenceBlock(span, OPTIONS, older);
   assert.equal(carried, firstCalls.length, 'referenceBlock reports them as inherited lines');
   assert.equal(refs, firstCalls.length + 1, 'the older span plus this one');
   assert.ok(block.startsWith(`${REFERENCES_HEADING}: seq ${firstCalls[0]}`), 'the heading starts at the OLDEST indexed call, not this span');
@@ -338,10 +316,10 @@ test('compiler: overlapping shadow ranges name a call once, never twice', () => 
   // of a span, then one that replaced the rest. One index must still hold one line
   // per call.
   const all = renumber([...first, summaryEvent(0, 5), summaryEvent(3, first.length - 1)]);
-  const older = shadowedCallEntries(fakeSession(all), all.length);
+  const older = Compiler.shadowedCallEntries(fakeSession(all), all.length);
   const seqs = older.map((entry) => entry.call.seq);
   assert.deepEqual(seqs, [...new Set(seqs)], 'no call seq is indexed twice');
-  const { refs } = referenceBlock(all.slice(first.length), OPTIONS, older);
+  const { refs } = Compiler.referenceBlock(all.slice(first.length), OPTIONS, older);
   assert.equal(refs, older.length, 'the section holds exactly the distinct shadowed calls');
 });
 
@@ -359,13 +337,13 @@ test('compiler: the pin block keeps EVERY human turn of the session, older spans
   const start = first.length + 2; // where `second` begins
   const session = fakeSession(all);
 
-  const older = shadowedHumanEntries(session, start);
+  const older = Compiler.shadowedHumanEntries(session, start);
   const firstHumans = first.filter((event) => event.type === 'user/message' && event.data?.source?.kind === 'user').map((event) => event.seq);
   assert.deepEqual(older.map((entry) => entry.seq), firstHumans, 'every human turn the earlier span shadowed comes back off the log');
 
   const spanHumans = all.slice(start).filter((event) => event.type === 'user/message' && event.data?.source?.kind === 'user').map((event) => event.seq);
   for (const ratio of [0.25, 0.02]) {
-    const { text, stats } = buildCheckpoint(session, start, all.length - 1, { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: ratio });
+    const { text, stats } = Compiler.buildCheckpoint(session, start, all.length - 1, { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: ratio });
     const lines = text.split('\n').filter((line) => /^- \[user seq \d+\]/.test(line));
     assert.equal(lines.length, firstHumans.length + spanHumans.length,
       `contextMaxRatio ${ratio}: a smaller output share never drops a human turn`);
@@ -405,13 +383,13 @@ test('compiler: an inbox-spliced human turn is named once — its echo never twi
   const echoSeq = first.length;
   const onlySeq = first.length + 1;
   const settledSeq = first.length + 2;
-  const turns = humanTurns(session, () => true);
+  const turns = Compiler.humanTurns(session, () => true);
   assert.ok(turns.some((entry) => entry.seq === onlySeq), 'a turn that exists ONLY as an inbox splice still gets a seq');
   assert.ok(!turns.some((entry) => entry.seq === echoSeq), 'the splice echoing a recorded user message is not named twice');
   assert.ok(!turns.some((entry) => entry.seq === settledSeq), 'a subagent settling through the inbox is not a request');
 
   // And it survives into the pin block at a tiny output budget, next to its turn.
-  const { text } = buildCheckpoint(session, start, all.length - 1, { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: 0.02 });
+  const { text } = Compiler.buildCheckpoint(session, start, all.length - 1, { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: 0.02 });
   assert.ok(text.includes(`- [user seq ${onlySeq}]`), 'the spliced-only turn keeps its own pinned line');
   const recorded = all.findIndex((event) => event.type === 'user/message' && event.data?.content?.[0]?.text === 'Turn 1: please work on task 1.');
   assert.ok(text.includes(`- [user seq ${recorded}]`), 'the recorded turn is named exactly once');
@@ -420,11 +398,11 @@ test('compiler: an inbox-spliced human turn is named once — its echo never twi
 test('compiler: contextMaxRatio shrinks the reference section and nothing else', () => {
   const events = buildEvents({ turns: 6, callsPerTurn: 3 });
   const session = fakeSession(events);
-  const wide = buildCheckpoint(session, 0, events.length - 1, OPTIONS);
+  const wide = Compiler.buildCheckpoint(session, 0, events.length - 1, OPTIONS);
   // A route with an 8,000-token window and a row asking for at most 5% of it: the
   // body may not exceed 1,600 bytes, so the reference budget falls from its ratio-sized
   // start toward the documented 1 KiB floor, and the oldest units age into one range line.
-  const tight = buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: 0.05 });
+  const tight = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: 0.05 });
 
   assert.ok(tight.stats.referenceBytes < Math.min(wide.stats.referenceBytes, REFERENCES_BLOCK_BYTES), 'the section shrank below its default budget');
   assert.ok(/earlier calls: seq \d+–\d+/.test(tight.text), 'the oldest units aged into one range line');
@@ -439,7 +417,7 @@ test('compiler: a generous ratio lists EVERY indexed call, with no fold line', (
   const session = fakeSession(events);
   // A window with room to spare: the section is sized from window × ratio, so it is
   // NOT capped at the legacy fixed block and nothing has to age into a range line.
-  const roomy = buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, contextWindowTokens: 1_000_000, contextMaxRatio: 0.5 });
+  const roomy = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, contextWindowTokens: 1_000_000, contextMaxRatio: 0.5 });
 
   assert.equal(roomy.stats.refsDropped, 0, 'nothing aged into a range line');
   assert.ok(!/earlier calls: seq \d+–\d+/.test(roomy.text), 'no fold line when the whole index fits');
@@ -462,8 +440,8 @@ test('compiler: contextMaxRatio is a share of the MESSAGE BUDGET the route leave
   const capFromWindow = Math.floor(windowTokens * ratio) * 4; // 16,000 bytes
   const capFromBudget = Math.floor(budgetTokens * ratio) * 4; // 8,000 bytes
 
-  const windowRun = buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, contextWindowTokens: windowTokens, contextMaxRatio: ratio });
-  const budgetRun = buildCheckpoint(session, 0, events.length - 1, {
+  const windowRun = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, contextWindowTokens: windowTokens, contextMaxRatio: ratio });
+  const budgetRun = Compiler.buildCheckpoint(session, 0, events.length - 1, {
     ...OPTIONS,
     contextWindowTokens: windowTokens,
     messageBudgetTokens: budgetTokens,
@@ -482,8 +460,10 @@ test('compiler: contextMaxRatio is a share of the MESSAGE BUDGET the route leave
   // under it (the old start handed over the whole share and halved down to fit).
   assert.ok(budgetRun.stats.bytes >= capFromBudget - 1_024, `the body filled its cap (${capFromBudget} bytes) rather than halving away from it`);
 
-  // Nothing else may move: the fixed blocks are carried whole at every size.
-  for (const [name, marker] of [['pinned', PINNED_OPEN], ['state', STATE_OPEN], ['instruction', INSTRUCTION_HEADING]]) {
+  // Nothing else may move: the fixed blocks are carried whole at every size. The
+  // instruction pair is NOT listed — this suite's default row leaves the built-in
+  // text blank, so the pair is absent unless a run names its own instruction.
+  for (const [name, marker] of [['pinned', PINNED_OPEN], ['state', STATE_OPEN]]) {
     assert.ok(budgetRun.text.includes(marker), `${name} block survives the tighter cap untouched`);
   }
 });
@@ -492,11 +472,11 @@ test('compiler: a route that names no budget, or an inconsistent one, sizes on t
   const events = buildEvents({ turns: 40, callsPerTurn: 6 });
   const session = fakeSession(events);
   const opts = { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: 0.5 };
-  const plain = buildCheckpoint(session, 0, events.length - 1, opts);
-  const unknown = buildCheckpoint(session, 0, events.length - 1, { ...opts, messageBudgetTokens: 0 });
+  const plain = Compiler.buildCheckpoint(session, 0, events.length - 1, opts);
+  const unknown = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...opts, messageBudgetTokens: 0 });
   // A budget wider than the window it sits inside cannot bound anything — a stale or
   // mismatched capacity reading. The window stands in rather than inventing room.
-  const impossible = buildCheckpoint(session, 0, events.length - 1, { ...opts, messageBudgetTokens: 20_000 });
+  const impossible = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...opts, messageBudgetTokens: 20_000 });
 
   assert.equal(unknown.stats.bytes, plain.stats.bytes, 'no budget named: the window is the basis');
   assert.equal(impossible.stats.bytes, plain.stats.bytes, 'a budget wider than its window is ignored');
@@ -509,7 +489,7 @@ test('compiler: a share smaller than the fixed blocks cost lands the section on 
   // 1% of 8,000 tokens is a 320-byte body — below what the context/pinned/state/thought/
   // instruction blocks cost on their own. The guard still shrinks what it can (the
   // reference section to its documented floor) and reports the minimum honest body.
-  const starving = buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: 0.01 });
+  const starving = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, contextWindowTokens: 8_000, contextMaxRatio: 0.01 });
 
   assert.equal(starving.stats.referenceBytes, 1_024, 'the section never goes below its floor');
   assert.ok(/earlier calls: seq \d+–\d+/.test(starving.text), 'and the index is folded to fit it');
@@ -520,10 +500,10 @@ test('compiler: a share smaller than the fixed blocks cost lands the section on 
 
 test('compiler: buildCheckpoint keeps an older checkpoint folded into its own span', () => {
   const older = buildEvents({ turns: 2, callsPerTurn: 1 });
-  const prior = buildCheckpoint(fakeSession(older), 0, older.length - 1, OPTIONS).text;
+  const prior = Compiler.buildCheckpoint(fakeSession(older), 0, older.length - 1, OPTIONS).text;
   const newer = buildEvents({ turns: 1, callsPerTurn: 1 });
   const all = renumber([...pad(older.length + 2), checkpointMessage(prior), ...newer]);
-  const { stats } = buildCheckpoint(fakeSession(all), 0, all.length - 1, OPTIONS);
+  const { stats } = Compiler.buildCheckpoint(fakeSession(all), 0, all.length - 1, OPTIONS);
   assert.equal(stats.carriedRefs, 2, 'stats name the lines inherited from earlier compactions');
   assert.equal(stats.refs, 3, 'the section covers every span it now indexes');
 });
@@ -531,19 +511,22 @@ test('compiler: buildCheckpoint keeps an older checkpoint folded into its own sp
 test('compiler: buildCheckpoint emits the blocks in fixed order', () => {
   const events = buildEvents({ turns: 2, callsPerTurn: 1 });
   const session = fakeSession(events);
-  const { text } = buildCheckpoint(session, 0, events.length - 1, OPTIONS);
+  // The built-in default is blank, so this fixture names its own instruction text —
+  // the ORDER of the pair (and not its wording) is what this test guards.
+  const opts = { ...OPTIONS, instructions: 'ALWAYS open the reply with a fresh summary.' };
+  const { text } = Compiler.buildCheckpoint(session, 0, events.length - 1, opts);
   const stateAt = text.indexOf(STATE_OPEN);
   const refsAt = text.indexOf(REFERENCES_HEADING);
   const thoughtAt = text.indexOf('[agent thought seq');
-  const instructionAt = text.indexOf(INSTRUCTION_HEADING);
-  assert.ok(stateAt >= 0 && refsAt >= 0 && thoughtAt >= 0 && instructionAt >= 0, 'every block present');
-  assert.ok(stateAt < thoughtAt && thoughtAt < refsAt && refsAt < instructionAt, 'state → thought → references → instruction');
+  const instructionAt = text.indexOf(SYSTEM_PROMPT_OPEN);
+  assert.ok(instructionAt >= 0 && stateAt >= 0 && refsAt >= 0 && thoughtAt >= 0, 'every block present');
+  assert.ok(instructionAt < stateAt && stateAt < thoughtAt && thoughtAt < refsAt, 'instruction opens the body, then state → thought → references');
 });
 
 test('compiler: buildCheckpoint stats name exactly what the blocks carry', () => {
   const events = buildEvents({ turns: 2, callsPerTurn: 1 });
   const session = fakeSession(events);
-  const { stats } = buildCheckpoint(session, 0, events.length - 1, OPTIONS);
+  const { stats } = Compiler.buildCheckpoint(session, 0, events.length - 1, OPTIONS);
   assert.equal(stats.start, 0, 'span start');
   assert.equal(stats.end, events.length - 1, 'span end');
   assert.equal(stats.events, events.length, 'every logged event in the span was read');
@@ -558,26 +541,32 @@ test('compiler: buildCheckpoint stats name exactly what the blocks carry', () =>
 test('compiler: instructions "" disables the block and custom text is carried verbatim', () => {
   const events = buildEvents({ turns: 1, callsPerTurn: 0 });
   const session = fakeSession(events);
-  const without = buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, instructions: '' });
-  assert.ok(!without.text.includes(INSTRUCTION_HEADING), 'no instruction block at all');
+  const without = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, instructions: '' });
+  assert.ok(!without.text.includes(SYSTEM_PROMPT_OPEN), 'no instruction block at all');
 
-  const custom = buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, instructions: 'Keep ${thoughtChars} words of thought.' });
-  assert.ok(custom.text.includes(`${INSTRUCTION_HEADING}\nKeep 200 words of thought.`), 'substitution uses the resolved cap');
+  const custom = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, instructions: 'Keep ${thoughtChars} words of thought.' });
+  assert.ok(custom.text.startsWith('</compacted-summary>\n\n<system prompt>\n'), 'the base open tag closes before the instruction pair opens the message');
+  assert.ok(custom.text.includes('Keep 200 words of thought.\n</system prompt>'), 'substitution uses the resolved cap and closes the tag');
 
-  const builtIn = buildCheckpoint(session, 0, events.length - 1, OPTIONS);
-  assert.ok(builtIn.text.includes(SESSION_LOG_INSTRUCTION.split('\n')[0]), 'the built-in block is carried when unset');
+  const builtIn = Compiler.buildCheckpoint(session, 0, events.length - 1, OPTIONS);
+  assert.ok(!builtIn.text.includes(SYSTEM_PROMPT_OPEN), 'the blank built-in default carries no pair — unset behaves like ""');
 });
 
 test('compiler: renamed recall tools are named wherever the checkpoint points at them', () => {
   const events = buildEvents({ turns: 2, callsPerTurn: 1 });
   const session = fakeSession(events);
-  const renamed = { ...OPTIONS, toolNames: { recall: 'fc_recall', search: 'fc_search' } };
-  const text = buildCheckpoint(session, 0, events.length - 1, renamed).text;
+  const renamed = {
+    ...OPTIONS,
+    toolNames: { recall: 'fc_recall', search: 'fc_search' },
+    instructions: 'Restore with ${recallTool}; call ${searchTool} for it first; keep ${thoughtChars} words.',
+  };
+  const text = Compiler.buildCheckpoint(session, 0, events.length - 1, renamed).text;
   assert.ok(text.includes('Restore any original with fc_recall {"seq": N}'), 'the reference header names the restoring tool');
   assert.ok(text.includes('call fc_search for it first'), 'the header names the search tool');
-  assert.ok(text.includes('retrievable with fc_recall'), 'the built-in instruction names the restoring tool');
-  assert.ok(text.includes('Restore it with fc_recall {"seq":N}'), 'the built-in restore line names the restoring tool');
-  assert.ok(text.includes('find it first with fc_search'), 'the built-in restore line names the search tool');
+  assert.ok(
+    text.includes('Restore with fc_recall; call fc_search for it first; keep 200 words.'),
+    'an instruction names both tools as the renamed row registered them, and takes the resolved cap',
+  );
 });
 
 /** Window numbers as one route really reports them (strata-llm/64KB, the tight route).
@@ -604,7 +593,7 @@ const WINDOW_STATS = {
 };
 
 test('compiler: the stats block is one line with the window percentages', () => {
-  const block = contextStatsBlock(WINDOW_STATS);
+  const block = Compiler.contextStatsBlock(WINDOW_STATS);
   assert.ok(block.startsWith(STATS_HEADING), 'own heading');
   assert.ok(block.split('\n').length === 2, 'heading plus ONE stats line');
   assert.ok(block.includes('- usage before compact: 42.6% of the window, after compact: 13.2%'), 'usage before and after, as shares of the window');
@@ -613,7 +602,7 @@ test('compiler: the stats block is one line with the window percentages', () => 
 });
 
 test('compiler: the one-line block states only the window shares', () => {
-  const block = contextStatsBlock(WINDOW_STATS);
+  const block = Compiler.contextStatsBlock(WINDOW_STATS);
   assert.ok(block.includes('gate 46.1% of the window'), 'the gate share, in the same basis as the usage shares');
   assert.ok(!block.includes('tool schemas'), 'no envelope breakdown: the gate never counts those tokens, so they stay out of the line');
   assert.ok(!block.includes('of the budget') && !block.includes('headroom'), 'no budget or headroom prose');
@@ -621,7 +610,7 @@ test('compiler: the one-line block states only the window shares', () => {
 
 test('compiler: a gate clamped to what the messages can reach says so', () => {
   const clamped = { ...WINDOW_STATS, requestedGateTokens: 58_982, clampedToCeiling: true, beyondBudget: true };
-  const block = contextStatsBlock(clamped);
+  const block = Compiler.contextStatsBlock(clamped);
   assert.ok(block.includes('(the row wanted 90.0% of the window; its messages top out at 46.1%, so it fires there)'), 'the clamp is stated with both shares');
   assert.ok(block.includes('a share past what the messages can hold, so pressure here runs on borrowed time'), 'and that the share sits beyond the message budget');
   assert.ok(!block.includes('message budget'), 'the note is about the shares, not about token arithmetic');
@@ -631,7 +620,7 @@ test('compiler: an unknown route capacity says n/a and keeps the counts', () => 
   const noCapacity = { ...WINDOW_STATS };
   delete noCapacity.contextWindow;
   delete noCapacity.messageBudget;
-  const block = contextStatsBlock(noCapacity);
+  const block = Compiler.contextStatsBlock(noCapacity);
   assert.ok(block.includes('usage before compact: n/a of the window (27,900 tokens, capacity unknown for strata-llm/64KB)'), 'says so instead of inventing a window');
   assert.ok(block.includes('after compact: n/a (~8,650 tokens, freed 19,250)'), 'token counts still come back');
   assert.ok(!block.includes('% of the window'), 'no window percentages claimed');
@@ -639,28 +628,28 @@ test('compiler: an unknown route capacity says n/a and keeps the counts', () => 
 
 test('compiler: the stats block names the debug dump file when the row knob attached one', () => {
   const dump = path.join('debug', 'session-s1-1761954000000-seq10-2046.txt');
-  const withDump = contextStatsBlock({ ...WINDOW_STATS, debugDumpPath: dump });
+  const withDump = Compiler.contextStatsBlock({ ...WINDOW_STATS, debugDumpPath: dump });
   assert.ok(withDump.split('\n').length === 3, 'usage line plus the dump line');
   assert.ok(withDump.includes(`- debug dump: ${dump}`), 'the on-disk copy is named where it lives');
-  const unknown = contextStatsBlock({ beforeTokens: 100, afterTokens: 90, gateTokens: 5, freedTokens: 10, route: 'p/m', debugDumpPath: dump });
+  const unknown = Compiler.contextStatsBlock({ beforeTokens: 100, afterTokens: 90, gateTokens: 5, freedTokens: 10, route: 'p/m', debugDumpPath: dump });
   assert.ok(unknown.includes(`- debug dump: ${dump}`), 'the capacity-unknown branch carries it too');
-  assert.ok(!contextStatsBlock(WINDOW_STATS).includes('debug dump'), 'and nothing is printed when no dump was attached');
+  assert.ok(!Compiler.contextStatsBlock(WINDOW_STATS).includes('debug dump'), 'and nothing is printed when no dump was attached');
 });
 
 test('compiler: the debug knob switches on the trail AND the window accounting', () => {
   const events = buildEvents({ turns: 2, callsPerTurn: 1 });
   const session = fakeSession(events);
-  const on = buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, debug: true, debugChars: 400, contextStats: WINDOW_STATS });
+  const on = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, debug: true, debugChars: 400, contextStats: WINDOW_STATS });
   assert.ok(on.text.includes(STATS_HEADING), 'the accounting block is present once the knob is on');
   const statsAt = on.text.indexOf(STATS_HEADING);
   const refsAt = on.text.indexOf(REFERENCES_HEADING);
-  const instructionAt = on.text.indexOf(INSTRUCTION_HEADING);
-  assert.ok(statsAt < refsAt && refsAt < instructionAt, 'accounting → references → instruction (the trail sits above it when a call failed)');
+  const instructionAt = on.text.indexOf(SYSTEM_PROMPT_OPEN);
+  assert.ok(instructionAt < statsAt && statsAt < refsAt, 'instruction opens the body, then accounting → references (the trail sits between them when a call failed)');
   assert.deepEqual(on.stats.contextStats, { ...WINDOW_STATS }, 'the numbers are recorded for /fastcompact as well');
 
   assert.ok(!on.text.includes(DEBUG_HEADING), 'the fixture has no failed call, so the trail stays out');
 
-  const off = buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, debug: false, contextStats: WINDOW_STATS });
+  const off = Compiler.buildCheckpoint(session, 0, events.length - 1, { ...OPTIONS, debug: false, contextStats: WINDOW_STATS });
   assert.ok(!off.text.includes(STATS_HEADING), 'no block without the row knob — one switch drives both');
   assert.equal(off.stats.contextStats, null, 'and nothing is recorded for the command');
 });
