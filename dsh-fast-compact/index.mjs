@@ -66,7 +66,7 @@ const DEFAULT_MAX_SEARCH_HITS = 40;
  */
 export const PLUGIN_INSTRUCTION_SOURCE_KIND = 'fastcompact-instruction';
 export const PLUGIN_INSTRUCTION = [
-  'dsh-fast-compact is active — every reply AND every thinking/reasoning block MUST open with within ~100 words summary as a index.',
+  'dsh-fast-compact is active — every piece of text you produce (visible replies, thinking/reasoning blocks, tool-call descriptions) MUST open with a natural-sentence(<100 words, no Symbol, no reporting tone) summary of what this text covers and where each part leads.',
   '\t1. Planning: write the plan into ./plan/${Subject}-Plan.md and tick its items as work moves.',
   '\t2. Past content — older tool output, earlier reasoning, anything cut from this window — lives ONLY in the session log. Reach it with OUR tools: ${searchTool} finds the FULL log (search BEFORE calling other tools), ${recallTool} {"seq":N} / {"result":N} / {"range":"A-B"} restores exact content. Never grep, read, or hunt logs/files yourself for past content, and never guess what was cut.',
 ].join('\n');

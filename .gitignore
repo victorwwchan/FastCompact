@@ -10,6 +10,9 @@ compaction-log.json
 /*.bak
 dsh-fast-compact/scratch/
 dsh-fast-compact/debug/
+.npm-cache/
+
+
 *Plan.md
 
 .usage.json
